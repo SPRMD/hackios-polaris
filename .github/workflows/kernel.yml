@@ -219,10 +219,10 @@ jobs:
         run: |
           set -e
           python3 - <<'PY'
-          import struct, sys
+          import struct, zlib
           p = "out/polaris/boot.img"
           d = open(p, "rb").read()
-          # Android boot image: "ANDROID!" magic, page size at byte 36 (little endian)
+          # Android boot image v0: "ANDROID!" magic, page size at byte 36 (little endian)
           assert d[:8] == b"ANDROID!", "no ANDROID! magic: %r" % d[:8]
           page = struct.unpack_from("<I", d, 36)[0]
           kernel_size = struct.unpack_from("<I", d, 8)[0]
@@ -231,16 +231,34 @@ jobs:
                 % (page, kernel_size, ramdisk_size, len(d)))
           assert page in (2048, 4096, 8192, 16384), "implausible page size %d" % page
           assert kernel_size > 0, "empty kernel"
-          assert len(d) > page, "image shorter than its own header page"
-          # The XNUP container must be inside, or the loader will find no payload.
-          assert b"XNUP" in d, "no XNUP payload in the image"
-          i = d.index(b"XNUP")
-          size = struct.unpack_from("<I", d, i + 4)[0]
-          print("XNUP at 0x%x, container size 0x%x (%d)" % (i, size, size))
+          assert len(d) >= page + kernel_size, "image truncated"
+          # The kernel field is gzip(BootShim + UEFI FD + XNUP container) + DTB (mkxnuimg.py),
+          # so the container is inside the compressed stream and not searchable in the raw
+          # image. The device tree is appended uncompressed after the gzip member, so
+          # decompress only the member: gzip.decompress() would reject the trailing DTB,
+          # while decompressobj stops at the member's end and keeps the tail.
+          body = d[page:page + kernel_size]
+          assert body[:2] == b"\x1f\x8b", "kernel field is not gzip: %r" % body[:2]
+          dec = zlib.decompressobj(zlib.MAX_WBITS | 16)
+          blob = dec.decompress(body) + dec.flush()
+          tail = dec.unused_data
+          print("decompressed kernel field: %d -> %d bytes, %d bytes of DTB after the member"
+                % (len(body), len(blob), len(tail)))
+          if len(tail) >= 4:
+              print("appended device tree magic: %r" % tail[:4])
+              assert tail[:4] == b"\xd0\x0d\xfe\xed", "appended data is not an FDT"
+          assert b"XNUP" in blob, "no XNUP container after decompression"
+          i = blob.index(b"XNUP")
+          csize = struct.unpack_from("<I", blob, i + 4)[0]
+          print("XNUP at 0x%x, container size 0x%x (%d)" % (i, csize, csize))
+          assert csize > 0 and i + csize <= len(blob), "container size does not fit"
           for name in (b"loader.efi", b"kernel", b"cmdline"):
-              assert name in d, "payload has no %r entry" % name
+              assert name in blob[i:i + csize], "payload has no %r entry" % name
           print("payload entries: loader.efi kernel cmdline -- all present")
-          assert b"platform=polaris" in d, "cmdline does not name the platform"
+          assert b"platform=polaris" in blob[i:i + csize], "cmdline does not name the platform"
+          # The DTB follows the gzip member inside the kernel field; report whether the
+          # bootloader will find one, without insisting on it (a shim-only image has none).
+          rest = body[len(body) - (len(body) - len(gzip.compress(b""))) :] if False else None
           print("OK")
           PY
 
