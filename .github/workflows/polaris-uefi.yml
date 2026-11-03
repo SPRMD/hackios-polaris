@@ -1,0 +1,133 @@
+name: polaris-uefi
+
+# Checks the polaris UEFI port (devices/polaris/uefi) without a UEFI toolchain and without a
+# phone. Two jobs:
+#
+#   consistency  reads this repository's own files and the numbers they claim about each other
+#                (tools/check-polaris-uefi.py). Pure Python, no network, no downloads.
+#   patch        fetches Mu-Silicium at the commit recorded in devices/polaris/uefi/BASE,
+#                applies devices/polaris/uefi/mu-silicium.patch for real, and checks that the
+#                files/ overlay lands on paths that exist in that tree. A shallow fetch of one
+#                commit, ~7 s, no submodules.
+#
+# NEITHER JOB BUILDS THE FIRMWARE. Building it needs EDK2/stuart, a Python environment, and the
+# 'Binaries' submodule (Project-Silicium/Device-Binaries, several GB, 74 polaris driver .inf
+# files and their .efi), and it has never been run from this repository. So there is no build
+# job here to mistake for a passing build: the port's claim is "these files are internally
+# consistent and the patch applies", not "this produces a bootable FD".
+#
+# The check is a safety net for edits, not proof about hardware. Addresses can only be checked
+# against polaris' own xbl.img and device tree; where each number came from is recorded in
+# devices/polaris/uefi/README.md.
+
+on:
+  push:
+    paths:
+      - "devices/polaris/uefi/**"
+      - "devices/polaris/device.conf"
+      - "tools/check-polaris-uefi.py"
+      - ".github/workflows/polaris-uefi.yml"
+  pull_request:
+    paths:
+      - "devices/polaris/uefi/**"
+      - "devices/polaris/device.conf"
+      - "tools/check-polaris-uefi.py"
+      - ".github/workflows/polaris-uefi.yml"
+  workflow_dispatch:
+
+jobs:
+  consistency:
+    name: internal consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the port against itself
+        run: python3 tools/check-polaris-uefi.py
+
+  patch:
+    name: the patch applies to BASE
+    needs: consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Mu-Silicium at BASE
+        run: |
+          set -euo pipefail
+          BASE=$(cat devices/polaris/uefi/BASE)
+          echo "BASE=$BASE"
+          mkdir -p /tmp/mu
+          git -C /tmp/mu init -q
+          git -C /tmp/mu remote add origin https://github.com/Project-Silicium/Mu-Silicium.git
+          # One commit, no submodules. If this fails the recorded BASE or the network is wrong,
+          # and that is worth failing on: the whole port is relative to this tree.
+          git -C /tmp/mu fetch -q --depth 1 origin "$BASE"
+          git -C /tmp/mu checkout -q FETCH_HEAD || {
+            echo "BASE $BASE is not fetchable from Mu-Silicium"; exit 1; }
+          test -d /tmp/mu/Platforms/Xiaomi || { echo "no Platforms/Xiaomi at BASE"; exit 1; }
+
+      - name: Apply mu-silicium.patch
+        run: |
+          set -euo pipefail
+          git -C /tmp/mu apply --whitespace=nowarn \
+            "$PWD/devices/polaris/uefi/mu-silicium.patch"
+          echo "applied cleanly"
+          # The patch is what wires the loader in. Check the wiring is actually there rather
+          # than trusting that "it applied".
+          INF=/tmp/mu/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+          grep -q 'XnuLoader.c' "$INF" || { echo "BootManagerLib.inf does not build XnuLoader.c"; exit 1; }
+          grep -q 'XnuLoader.h' /tmp/mu/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c \
+            || { echo "BootManager.c does not include XnuLoader.h"; exit 1; }
+          grep -q 'XnuLoaderMain' /tmp/mu/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c \
+            || { echo "BootManager.c never calls XnuLoaderMain"; exit 1; }
+          grep -q 'PAYLOAD_BASE' /tmp/mu/BootShim/BootShim.S \
+            || { echo "BootShim.S has no PAYLOAD_BASE handling"; exit 1; }
+          grep -q 'HACKIOS POLARIS' /tmp/mu/Silicon/Silicium/SiliciumPkg/Sec/Sec.c \
+            || { echo "Sec.c does not carry the polaris banner"; exit 1; }
+
+      - name: The files/ overlay lands on real paths
+        run: |
+          set -euo pipefail
+          cd devices/polaris/uefi/files
+          rc=0
+          while IFS= read -r rel; do
+            if [ -e "/tmp/mu/$rel" ]; then
+              continue
+            fi
+            # New files the overlay introduces, which the patch references. A case pattern so
+            # that a multi-line list cannot be broken by the indentation of a here-doc.
+            case "$rel" in
+              Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.[ch])
+                echo "new (intended): $rel"; continue ;;
+            esac
+            # A path that is neither upstream nor on the allow-list is a typo away from
+            # creating a second platform package that nothing builds.
+            echo "::error::$rel is neither in Mu-Silicium at BASE nor a known new file"
+            rc=1
+          done < <(find . -type f | sed 's|^\./||')
+          exit $rc
+
+      - name: Report what the overlay replaces
+        run: |
+          set -euo pipefail
+          cd devices/polaris/uefi/files
+          changed=0
+          while IFS= read -r rel; do
+            # --strip-trailing-cr: this comparison is about content, and a checkout with
+            # core.autocrlf set would otherwise make every file look modified.
+            if [ -e "/tmp/mu/$rel" ] && ! diff -q --strip-trailing-cr "$rel" "/tmp/mu/$rel" >/dev/null; then
+              echo "replaces upstream: $rel"
+              changed=$((changed + 1))
+            fi
+          done < <(find . -type f | sed 's|^\./||')
+          echo "$changed file(s) differ from upstream at BASE; the rest is upstream verbatim"
+          # Upstream already ships a polaris platform package, so 0 would mean the overlay was
+          # lost -- which is exactly the failure this job exists to catch.
+          test "$changed" -gt 0

@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "Polaris' own UEFI drivers, as published by Project-Silicium/Device-Binaries under polaris/.",
+    "Unlike raphael's file (which records hand-made patches to binaries extracted from the",
+    "phone's own xbl.img), polaris needs no patch tool: Device-Binaries already ships the",
+    "patched modules as <module>.patched.efi, and the .inf files in that repository already",
+    "select them. Nothing here is applied by any script in this repository; it is a description",
+    "of what the upstream submodule contains, kept so the port can be re-audited."
+  ],
+  "source": "https://github.com/Project-Silicium/Device-Binaries",
+  "path": "polaris",
+  "commit": "9f4dbfd7d61acdae69fd5bb48720ce7e53711e25",
+  "binaries": {
+    "directory": "Mu-Silicium/Binaries/polaris",
+    "provided_by": "the Mu-Silicium 'Binaries' submodule (Device-Binaries)",
+    "note": "Not committed here and MUST NOT be fabricated. A build without it fails; that is the honest state."
+  },
+  "patched_modules": [
+    {
+      "module": "QcomPkg/Drivers/ButtonsDxe/ButtonsDxe",
+      "patched_file": "ButtonsDxe.patched.efi",
+      "unpatched_sha256": "cd58d139e3180ea42d7828053a70b6b9fca1ad9c4f474625272b2a22cfba482e",
+      "patched_sha256": "da14323b898567187fee9faaef80f8a61508a7ddb7b837856ddeaa4955a1a6be",
+      "reason": "Make the Power button usable in UEFI instead of the Qualcomm key code."
+    },
+    {
+      "module": "QcomPkg/Drivers/UsbConfigDxe/UsbConfigDxe",
+      "patched_file": "UsbConfigDxe.patched.efi",
+      "unpatched_sha256": "09129e7d8388cb3585a10ac093ca7a957d24058e69d05b73063816dfb3a40a31",
+      "patched_sha256": "48b4e59bca4ae9e383715b3ecabe82b61c3cc18f5d612573da789bf998cea09e",
+      "reason": "Drop the USB deinit from ExitBootServices so the OS keeps the port."
+    },
+    {
+      "module": "QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe",
+      "patched_file": "HALIOMMUDxe.patched.efi",
+      "unpatched_sha256": "e75dee9a49bcfb0cb2e0c80cac184582b797c23b4e4dcfa02d038d4f66b9b7c2",
+      "patched_sha256": "91fbccfca68114707917a5d84da748bd58a7b90c48c7c99754f36c742e5dc4fd",
+      "reason": "polaris-specific: keep the IOMMU out of the way for the display path; not in raphael's set."
+    }
+  ],
+  "not_patched": [
+    {
+      "module": "QcomPkg/Drivers/DALSYSDxe/DALSYSDxe",
+      "reason": "raphael patches this for UFS cache coherence. polaris' Device-Binaries copy is unpatched and there is no polaris measurement showing it is needed. TODO(polaris): decide after a boot."
+    },
+    {
+      "module": "QcomPkg/Drivers/TzDxe/TzDxeLA",
+      "reason": "redwood patches the global TZ applet variable. polaris' copy is unpatched; TODO(polaris): check whether polaris' TZ applet needs the same variable before trusting it."
+    },
+    {
+      "module": "QcomPkg/Drivers/UsbMsdDxe/UsbMsdDxe",
+      "reason": "redwood marks the disk non-removable. polaris' copy is unpatched; TODO(polaris): decide whether polaris' UsbMsdDxe needs it."
+    }
+  ],
+  "gaps": [
+    "No panel XML and no DisplayDxe tuning data exist under polaris/RawFiles (the directory holds only .cfg, .bmp and BATTERY.PROVISION files). That is why USE_CUSTOM_DISPLAY_DRIVER is 0 here.",
+    "polaris/QcomPkg/XBLCore/XBLCore.{inf,raw,te} exists; the UEFI FD is built by Mu, not taken from there."
+  ]
+}

@@ -3,6 +3,7 @@
 # is named here.
 /*
 !/.gitignore
+!/.github/
 !/README.md
 !/AGENTS.md
 !/CONTRIBUTING.md
