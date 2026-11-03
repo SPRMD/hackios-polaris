@@ -27,8 +27,6 @@ EXPECT = {
     'payload_base': 0xA0000000,
     'fb_base': 0x9D400000,
 }
-# Addresses that would mean the image was built for a different board.
-BAD_BASES = {0xA0000000: 'polaris', 0x9FD00000: 'poco-x5-pro (redwood)', 0x9FC00000: 'polaris'}
 # SoC names that must not appear anywhere in the device tree.
 FOREIGN_SOCS = (b'Yupik', b'yupik', b'redwood', b'SM7325', b'sm7325', b'cape', b'Cape')
 

@@ -384,6 +384,11 @@ jobs:
             --expect-payload-base "$PAYLOAD_BASE" \
             --fd-base "$FD_BASE" --fd-size "$FD_SIZE" \
             --payload-size "$(stat -c %s out/polaris/usb-payload.bin)"
+          # The payload address exists in five places (device.conf, the shim's define, the
+          # firmware's XnuLoader.h, the firmware's memory map, the loader's define). They all
+          # have to agree; this checks the sources rather than the built image, so it also
+          # covers the firmware, which is not built in this workflow.
+          python3 tools/check-addresses.py
 
       - name: Upload boot.img
         uses: actions/upload-artifact@v4
