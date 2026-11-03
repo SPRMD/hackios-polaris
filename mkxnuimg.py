@@ -35,12 +35,22 @@ ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
 fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-# The shim is 42 lines of assembly whose only job is to copy the FD to FD_BASE and jump to
-# it, and it has to be assembled with THIS board's FD_BASE/FD_SIZE/PAYLOAD_BASE. A full
-# Mu-Silicium tree is one place to get it; devices/<name>/prebuilt/BootShim is the other,
-# so an image can be rebuilt from the committed firmware alone. Without this fallback the
-# kernel workflow's pack step could not run at all: it has no Mu-Silicium tree, so it fell
-# through to the refusal below even though it had been handed a correct FD and DTB.
+
+# The payload has to be read before the shim is assembled: the shim copies it to
+# XNU_PAYLOAD_BASE and therefore needs its size as a constant. It rides directly after
+# the FD in the image, so the shim finds it at (_Payload + FD_SIZE).
+payload = b''
+if args.payload:
+    payload = open(args.payload, 'rb').read()
+    assert payload[:4] == b'XNUP' and len(payload) <= PAYLOAD_MAX - 0x1000, 'bad or oversized payload'
+
+# The shim's job is to place the UEFI volume at FD_BASE and the payload at PAYLOAD_BASE,
+# then jump to the firmware. It must be assembled with THIS board's addresses, which is
+# what makes a prebuilt shim from another device unusable and a purpose-built one
+# necessary. A full Mu-Silicium tree is one place to get it;
+# devices/<name>/prebuilt/BootShim is the other, so an image can be rebuilt from the
+# committed firmware alone. Without that fallback the kernel workflow's pack step could
+# not run at all: it has no Mu-Silicium tree.
 SHIM_FALLBACK = os.path.join(HERE, 'devices', TARGET, 'prebuilt', 'BootShim')
 shim_dir = os.path.join(MU, 'BootShim')
 if not os.path.isdir(shim_dir) and os.path.isfile(os.path.join(SHIM_FALLBACK, 'BootShim.S')):
@@ -49,8 +59,14 @@ if os.path.isfile(fd_path) and os.path.isdir(shim_dir):
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
         except FileNotFoundError: pass
+    # The shim's own Makefile only knows FD_BASE/FD_SIZE (upstream's shim copies the FD
+    # alone). PAYLOAD_BASE and PAYLOAD_SIZE are passed through CFLAGS as defines; the
+    # shim source reads them with ldr /=, so they must be link-time constants.
+    shim_cflags = ('--target=aarch64-linux-gnu '
+                   f'-DPAYLOAD_BASE={PAYLOAD_BASE:#x} -DXNU_PAYLOAD_BASE={PAYLOAD_BASE:#x} '
+                   f'-DPAYLOAD_SIZE={len(payload):#x}')
     subprocess.check_call(['make', 'REQUIRES_KERNEL_HEADER=1', f'FD_BASE={FD_BASE:#x}', f'FD_SIZE={FD_SIZE:#x}',
-                           f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
+                           f'CFLAGS={shim_cflags}'],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
     # The DTB and mkbootimg come from the Mu-Silicium tree when there is one; otherwise take
     # the DTB the caller exported (device.conf names it, and prebuilt supplies it).
@@ -76,13 +92,16 @@ fd = open(parts['fd'], 'rb').read()
 assert len(fd) == FD_SIZE, hex(len(fd))
 
 blob = shim + fd
-if args.payload:
-    data = open(args.payload, 'rb').read()
-    # the payload file is a complete "XNUP" container (see xnuloader/mkpayload.py)
-    assert data[:4] == b'XNUP' and len(data) <= PAYLOAD_MAX - 0x1000, 'bad or oversized payload'
-    blob += data
+if payload:
+    blob += payload
     blob += b'\0' * (-len(blob) % 16)
-    print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')
+    print(f'payload: {len(payload)} bytes, bytesum={sum(payload) & 0xffffffff:08x}')
+    # The shim copies it from _Payload + FD_SIZE to PAYLOAD_BASE. State the addresses so a
+    # mismatch with the firmware's XNU_PAYLOAD_BASE is visible in the log rather than only
+    # on the phone's screen.
+    if TARGET != 'redwood':
+        print(f'payload placed at FD_BASE+FD_SIZE={FD_BASE + FD_SIZE:#x}, '
+              f'shim copies it to PAYLOAD_BASE={PAYLOAD_BASE:#x}')
 
 if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
 dtb = open(parts['dtb'], 'rb').read()

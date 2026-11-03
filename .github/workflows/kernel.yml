@@ -48,6 +48,13 @@ jobs:
       - name: Build
         run: |
           set -e
+          # The loader's PAYLOAD_BASE must equal the firmware's XNU_PAYLOAD_BASE and the
+          # address the boot shim copies the payload to. Exporting the device profile is
+          # what keeps the three in step: on polaris 0xF0000000 is above the top of DDR.
+          set -a
+          . ./devices/polaris/device.conf
+          set +a
+          echo "PAYLOAD_BASE=$PAYLOAD_BASE (loader), XNU_PAYLOAD_BASE=$PAYLOAD_BASE (firmware), shim target same"
           # xnuloader/build.sh wants an identity.h made from the builder's own IPSW. The
           # placeholder path exists for exactly this: building the loader without Apple's
           # files. It is not an identity that can boot iOS, only one that links.

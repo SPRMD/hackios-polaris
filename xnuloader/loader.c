@@ -15,7 +15,23 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
+/*
+ * PAYLOAD_BASE is where the boot shim leaves the XNUP container, and where this loader
+ * finds it. It is per board: the shim copies the payload here with a literal address, so
+ * the two must agree exactly.
+ *
+ *   0xF0000000  raphael and redwood. On polaris this address is NOT memory: the board's
+ *               DDR ends at 0xB9400000 (from this phone's own uefiplat.cfg), so a payload
+ *               copied there goes into the MMIO hole and reads back as garbage.
+ *   0xA0000000  polaris. Also the address XnuLoader.h uses (XNU_PAYLOAD_BASE) and the
+ *               MemoryMapLib reservation "XNU Payload", so all three agree.
+ *
+ * build.sh passes it from devices/<name>/device.conf. The default stays raphael's so a
+ * build without the define behaves as before.
+ */
+#ifndef PAYLOAD_BASE
 #define PAYLOAD_BASE        0xF0000000ULL
+#endif
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
