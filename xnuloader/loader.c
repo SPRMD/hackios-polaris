@@ -2506,9 +2506,29 @@ wdt_arm(void)
 
 extern char __ImageBase;
 
+static int exception_hook_installed;
+
+/*
+ * Set while fw_cfg_present() (much further down) probes QEMU's fw_cfg interface, which is not
+ * mapped on hardware. exception_handler() reads them, so they are declared here.
+ */
+static volatile int fw_cfg_probe_active;
+static volatile int fw_cfg_probe_faulted;
+
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
 {
+	/*
+	 * A fault taken inside fw_cfg_present() is the answer to its question, not a failure:
+	 * the address is not mapped, so this is hardware, not QEMU. Skip the faulting load and
+	 * let the probe return "no". Everything else is a real crash and is reported.
+	 */
+	if (fw_cfg_probe_active && type == 0) {
+		fw_cfg_probe_active = 0;
+		fw_cfg_probe_faulted = 1;
+		ctx[EXC_CTX_ELR] += 4;
+		return;
+	}
 	print("\nUEFI EXCEPTION type=%d elr=%x esr=%x far=%x lr=%x sp=%x spsr=%x\n", (uint64_t)type, ctx[EXC_CTX_ELR],
 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
@@ -2533,6 +2553,8 @@ install_exception_hook(void)
 		efi_status s = cpu->register_interrupt_handler(cpu, type, exception_handler);
 		if (EFI_ERROR(s)) {
 			print("exception hook %d: status %x\n", (uint64_t)type, s);
+		} else {
+			exception_hook_installed = 1;
 		}
 	}
 }
@@ -4001,8 +4023,15 @@ usb_command_loop(void)
  * QEMU's "ramfb" display shows whatever guest memory it is told to, in any size; the firmware
  * only offers a few small landscape modes of it. So we point it at memory of our own with the
  * shape of the iPhone's screen, through the fw_cfg file "etc/ramfb" (the firmware's own mode
- * is simply replaced). In QEMU the display is then exactly what iOS expects; on the real phone
- * the kernel's display driver scales that picture to the panel.
+ * is simply replaced). In QEMU the display is then exactly what iOS expects.
+ *
+ * This is QEMU ONLY. fw_cfg lives at 0x09020000, which on a phone is not mapped at all, so
+ * touching it raises a synchronous exception from EL1 -- and it is reached exactly when the
+ * framebuffer IS real, i.e. on the phone. That is how the first polaris boot died: the
+ * firmware printed its banner, started this loader, the loader found a real GOP framebuffer,
+ * called ramfb_phone_screen() to reshape it, and took a data abort at FW_CFG_BASE+8 before it
+ * had installed its own exception hook. The gate is the presence of fw_cfg, not of a
+ * framebuffer: fw_cfg_present() probes for it safely and only then is ramfb configured.
  */
 #define PHONE_WIDTH     1125            /* the screen of the iPhone X, whose identity we carry */
 #define PHONE_HEIGHT    2436
@@ -4015,6 +4044,42 @@ static uint32_t
 be32(uint32_t v)
 {
 	return __builtin_bswap32(v);
+}
+
+/*
+ * Is fw_cfg there? A QEMU virt machine answers the signature at FW_CFG_BASE with "QEMU", which
+ * is also how the kernel tells the two apart. On hardware the read itself faults, so it is
+ * done with the exception hook already installed and a flag set: exception_handler() checks
+ * the flag, records the fault and skips the instruction, and returns here with "no".
+ */
+static int
+fw_cfg_present(void)
+{
+	static const char want[4] = { 'Q', 'E', 'M', 'U' };
+	char got[4];
+	int ok = 1;
+
+	if (!exception_hook_installed) {
+		return 0;                       /* cannot probe safely: assume hardware */
+	}
+	__asm__ volatile ("dmb sy" ::: "memory");
+	fw_cfg_probe_active = 1;
+	fw_cfg_probe_faulted = 0;
+	*(volatile uint16_t *)(FW_CFG_BASE + 8) = __builtin_bswap16(FW_CFG_FILE_DIR);
+	for (int i = 0; i < 4; i++) {
+		got[i] = *(volatile char *)(FW_CFG_BASE + i);
+	}
+	__asm__ volatile ("dmb sy" ::: "memory");
+	fw_cfg_probe_active = 0;
+	if (fw_cfg_probe_faulted) {
+		return 0;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (got[i] != want[i]) {
+			ok = 0;
+		}
+	}
+	return ok;
 }
 
 static void
@@ -4092,6 +4157,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
+	/*
+	 * Before anything that can fault: until now a crash here went to the firmware's own
+	 * handler, which prints nothing on this board, so the first polaris boot ended at a
+	 * bare "Synchronous Exception at 0x...". Everything below reports through this hook.
+	 */
+	install_exception_hook();
+	print("exception hook: %s\n", exception_hook_installed ? "installed" : "NOT INSTALLED");
+
 	PLAT = &platform_qemu_virt;
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
@@ -4101,10 +4174,16 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = SCREEN.base == 0x9c000000 ? &platform_raphael : &platform_redwood;
-		} else {
+		/*
+		 * ramfb is QEMU's, and fw_cfg is how it is asked: on hardware that address is
+		 * unmapped, so it must be probed rather than assumed. A real framebuffer is not
+		 * evidence of QEMU -- that inversion is what crashed the first polaris boot.
+		 */
+		if (fw_cfg_present()) {
+			print("fw_cfg present: QEMU, reshaping the display for ramfb\n");
 			ramfb_phone_screen();
+		} else {
+			print("no fw_cfg: a real panel, using the firmware's framebuffer\n");
 		}
 		/*
 		 * The block above cannot tell raphael from polaris: both put the framebuffer at
@@ -4133,7 +4212,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("platform %s\n", PLAT->name);
 	persist_logs = PLAT == &platform_redwood;
 
-	install_exception_hook();
+	/* The hook went in before the display, which is what can fault on hardware. */
 	if (PLAT == &platform_raphael) {
 		/* Retain ABL's command-mode pipeline and refresh it once per tear-check frame. */
 		volatile uint32_t *pp = (volatile uint32_t *)0x0ae71000ULL;
