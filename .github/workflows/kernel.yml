@@ -31,6 +31,42 @@ jobs:
           git -C /tmp/xnu apply --whitespace=nowarn --check "$PWD/xnu/hakios.patch"
           echo "patch applies; $(grep -c '^diff --git' xnu/hakios.patch) files changed"
 
+  loader:
+    name: build the loader
+    needs: patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang lld llvm
+          clang --version | head -1
+
+      - name: Build
+        run: |
+          set -e
+          # xnuloader/build.sh wants an identity.h made from the builder's own IPSW. The
+          # placeholder path exists for exactly this: building the loader without Apple's
+          # files. It is not an identity that can boot iOS, only one that links.
+          cd xnuloader
+          ./mkidentity.sh --placeholder || true
+          ls -l identity.h || { echo "no identity.h"; exit 1; }
+          cd ..
+          ./xnuloader/build.sh
+          ls -l xnuloader/loader.efi
+          sha256sum xnuloader/loader.efi
+
+      - name: Upload the loader
+        uses: actions/upload-artifact@v4
+        with:
+          name: loader.efi
+          path: xnuloader/loader.efi
+          if-no-files-found: error
+          retention-days: 14
+
   kernel:
     name: build the kernel
     needs: patch
@@ -51,11 +87,15 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update -qq
+          # uuid-dev is what xnu-deps/hostinc/hostcompat.h includes as <uuid/uuid.h>; without
+          # it the SETUP/ host tools (decomment, setsegname, ...) fail to compile and
+          # `exporthdrs` dies before the kernel build starts.
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential clang lld llvm flex bison m4 perl autoconf automake \
-            libtool pkg-config xz-utils unzip zlib1g-dev libssl-dev \
+            libtool pkg-config xz-utils unzip zlib1g-dev libssl-dev uuid-dev \
             ca-certificates curl git python3 python3-venv
           clang --version | head -1
+          test -f /usr/include/uuid/uuid.h || { echo "uuid-dev missing"; exit 1; }
 
       - name: Theos (cctools for the Mach-O link, and the iPhoneOS SDK)
         run: |
@@ -72,9 +112,14 @@ jobs:
           ls "$THEOS/toolchain/linux/iphone/bin" | head -20
           test -x "$THEOS/toolchain/linux/iphone/bin/ld" \
             || { echo "no cctools at \$THEOS/toolchain/linux/iphone/bin"; exit 1; }
-          # The SDK the kernel is compiled against: theos' own installer, which knows the
-          # current release URL for the patched SDKs.
-          "$THEOS/bin/install-sdk" 16.5 || "$THEOS/bin/install-sdk" latest
+          # The SDK the kernel is compiled against. `install-sdk 16.5` is not offered by theos
+          # any more ("we do not currently provide 16.5.sdk"), but `latest` installs an
+          # iPhoneOS16.5.sdk anyway -- which is what this kernel needs. Try the exact version,
+          # fall back to latest, and judge only by whether the directory arrived.
+          "$THEOS/bin/install-sdk" 16.5 || true
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" ]; then
+            "$THEOS/bin/install-sdk" latest
+          fi
           ls "$THEOS/sdks"
           test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" \
             || { echo "no iPhoneOS16.5.sdk in \$THEOS/sdks"; ls -la "$THEOS/sdks"; exit 1; }

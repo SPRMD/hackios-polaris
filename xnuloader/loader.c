@@ -558,6 +558,27 @@ static const struct platform platform_raphael = {
 	.cores = 8, .core_shift = 8, .small_cores = 0x0f,
 };
 
+/*
+ * Xiaomi Mi MIX 2S (polaris, SDM845). From the phone's own device tree in the official MIUI
+ * 12.5 package: model "Xiaomi Technologies, Inc. Polaris P2 v2.1", qcom,board-id <0x2a 0x0>,
+ * qcom,msm-id <0x141 0x20001>.
+ *
+ * The GIC addresses are the same as raphael's (0x17A00000 / 0x17A60000) and the timer's PPI is
+ * the same 3 (boot-arg gic_timer_irq=19) -- Qualcomm kept that layout across SDM845/SM8150.
+ *
+ * cores = 4, not 8: only the four Cortex-A55s (MPIDR 0x000..0x300) have ever been observed
+ * starting under XNU on polaris, on either boot chain. The four Cortex-A75s (0x400..0x700)
+ * have never been brought up, so asking for 8 here would promise cores that do not arrive.
+ *
+ * small_cores = 0x0f is the whole set we run on: every core we use is an A55, so the kernel's
+ * "slow core" partner selection has nothing to prefer.
+ */
+static const struct platform platform_polaris = {
+	.name = "polaris", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000,
+	.cores = 4, .core_shift = 8, .small_cores = 0x0f,
+};
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -2528,6 +2549,52 @@ parse_number(const char *c, unsigned base)
 }
 
 static int
+/*
+ * bootarg(PREFIX): the text after `prefix` in the payload's cmdline entry, or NULL.
+ *
+ * The platform has to be chosen before parse_payload() runs (the selection decides how the
+ * payload is started), so this walks the payload itself rather than taking a struct
+ * payload_info. It only looks for the one entry it needs and does not validate anything else.
+ * A prefix must be followed by a space or the end of the line, so "platform=polarisx" does not
+ * match "platform=polaris".
+ */
+static const char *
+bootarg(const char *prefix)
+{
+	const struct payload_header *ph = (const struct payload_header *)PAYLOAD_BASE;
+
+	if (ph->magic != PAYLOAD_MAGIC) {
+		return NULL;
+	}
+	size_t want = str_len(prefix);
+	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
+	while (p + sizeof(struct payload_entry) <= pend) {
+		const struct payload_entry *e = (const struct payload_entry *)p;
+		const char *text = (const char *)(p + sizeof(*e));
+		if (e->name[0] == 0) {
+			break;
+		}
+		if (str_eq(e->name, "cmdline")) {
+			for (const char *c = text; *c; c++) {
+				if (c != text && c[-1] != ' ') {
+					continue;
+				}
+				/* prefix, then a space or the end: "platform=polarisx" is not a match */
+				size_t i = 0;
+				while (i < want && c[i] == prefix[i]) {
+					i++;
+				}
+				if (i == want && (c[i] == 0 || c[i] == ' ')) {
+					return c + want;
+				}
+			}
+			return NULL;
+		}
+		p += sizeof(*e) + ((e->size + 15) & ~15u);
+	}
+	return NULL;
+}
+
 parse_payload(struct payload_info *pi, int verbose)
 {
 	struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
@@ -4023,6 +4090,28 @@ efi_main(efi_handle image, efi_system_table *st)
 			PLAT = SCREEN.base == 0x9c000000 ? &platform_raphael : &platform_redwood;
 		} else {
 			ramfb_phone_screen();
+		}
+		/*
+		 * The block above cannot tell raphael from polaris: both put the framebuffer at
+		 * 0x9c000000, and the outer test (0xE1000000) is mutually exclusive with the inner
+		 * one (0x9c000000), so on a phone it never selects anything. Until the two boards
+		 * are told apart by something that is actually theirs -- polaris' XBL memory map,
+		 * or a DT compatible the loader can read -- the platform is named explicitly.
+		 *
+		 * payload.cmdline: "platform=polaris" or "platform=raphael". Absent, behaviour is
+		 * unchanged, so nothing that works today can break by this.
+		 */
+		{
+			const char *want = bootarg("platform=");
+			if (want != NULL) {
+				if (str_eq(want, "polaris") || starts_with(want, "polaris ")) {
+					PLAT = &platform_polaris;
+				} else if (str_eq(want, "raphael") || starts_with(want, "raphael ")) {
+					PLAT = &platform_raphael;
+				} else if (str_eq(want, "redwood") || starts_with(want, "redwood ")) {
+					PLAT = &platform_redwood;
+				}
+			}
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
