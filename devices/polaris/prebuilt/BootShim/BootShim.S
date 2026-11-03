@@ -59,6 +59,7 @@ _StackSize:
 #endif
 
 _Start:
+  add   x1, x1, #SHIM_SIZE /* x1 = where the FD begins: the packer pads this shim to it */
   mov   x4, x1          /* x4 = the FD's source address */
   ldr   x10, =FD_SIZE
   add   x10, x4, x10    /* x10 = where the payload is now: just past the FD */
