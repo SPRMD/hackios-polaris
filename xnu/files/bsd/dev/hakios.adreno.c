@@ -109,12 +109,37 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
 /* SM8150 variants below follow zundamon_raphael drivers/gpu/msm and gpucc/debugcc-sm8150. */
 static bool a640;
+
+/*
+ * SM8250/SDM845 (polaris, the Xiaomi Mi MIX 2S, Adreno 630) gets its own flag rather than a third
+ * arm of every `a640 ? ... : ...` in this file. The older arm is a 640-shaped guess written for
+ * sc7280 (redwood): several of its values are another SoC's registers, so nothing here may fall
+ * through to them. Where an SDM845 value is known from the vendor tree it is given below; where
+ * none is, the polaris branch says so out loud and names what has to be obtained, and no read is
+ * made against a made-up offset.
+ *
+ * Read-only: with the polaris flag set nothing in this file writes a GPU, GMU, GPUCC or SMMU
+ * register. Steps 4, 5, 10 and everything after them -- the ones that power the block, load
+ * firmware into the GMU, or start the 3D core -- stop with "not implemented for polaris" instead.
+ */
+static bool polaris;
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 static uint32_t step;                   /* the one being performed */
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+
+/*
+ * A step that declines to do its work because the work is not implemented for this SoC sets this
+ * before returning false, and the ladder treats the false as "refused", not "failed": it says so
+ * and goes on to the next step. That distinction is the point of this port. On polaris the write
+ * steps (4, 5, 10, and everything after 10) refuse, while the read steps (1, 2, 3, 6, 8, 9) must
+ * still run -- a ladder that stopped at step 4 would never report what the GPU is, which is the
+ * only thing being asked of it.
+ */
+static bool step_refused;
+static uint32_t refused_count;
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -287,18 +312,38 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
  * gcc-sc7280.c. The touch screen driver uses this controller too.
  */
 static struct block gcc = { "gcc", 0x00100000, 0x80000 };
-#define GCC_PLL_VOTE            (a640 ? 0x52004u : 0x52000u)         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
+/*
+ * SDM845 (polaris), byte offsets: gcc-sdm845.c. The two GPU PLL votes are the two halves of one
+ * register there -- bit 15 gcc_gpu_gpll0_clk_src, bit 16 gcc_gpu_gpll0_div_clk_src, both at
+ * 0x52004 -- where sc7280 splits them across 0x52000/0x52004, so the redwood value below is not
+ * this SoC's and polaris says its own. Likewise gcc_ddrss_gpu_axi_clk is 0x44038 on SDM845, not
+ * the 0x71154 the sc7280 arm assumes, and the three 0x710xx branches happen to agree with it.
+ */
+#define GCC_PLL_VOTE            (polaris ? 0x52004u : (a640 ? 0x52004u : 0x52000u)) /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
 #define GCC_PLL_VOTE_GPU_DIV    (1u << 16)
 #define GCC_GPU_CFG_AHB_CBCR    0x71004
 #define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
 #define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
-#define GCC_DDRSS_GPU_AXI_CBCR  0x71154
+#define GCC_DDRSS_GPU_AXI_CBCR  (polaris ? 0x44038u : 0x71154u)
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c) */
 #define CMD_DB_PHYS             (a640 ? 0x85f20000UL : 0x80860000UL)
 #define CMD_DB_SIZE             0x20000UL
+
+/*
+ * SDM845 is different in kind, not just in address: the phone's device tree gives cmd_db as
+ *
+ *	qcom,cmd-db@861e0000  { reg = <0x0c3f000c 0x8>; }
+ *
+ * which is a descriptor, not the table. cmd_db_dev_probe() (vendor cmd-db.c) ioremaps exactly that
+ * and reads two 32-bit words: the first is where the real table starts, the second its length. So
+ * the address of the table itself is only known at run time and cannot be a compile-time constant
+ * here -- polaris reads the descriptor first and maps whatever it points at. From the device tree
+ * alone the table's own address is not obtainable; the descriptor is the only handle the tree gives.
+ */
+#define CMD_DB_DESCRIPTOR_PHYS  0x0c3f000cUL
 
 struct cmd_db_slave {
 	uint16_t id, header_offset, data_offset, count, version, reserved[3];
@@ -318,6 +363,41 @@ struct cmd_db_entry {
 };
 
 static const struct cmd_db_header *cmd_db;
+static uint32_t cmd_db_size = CMD_DB_SIZE;      /* not a constant on SDM845: see above */
+
+/*
+ * Map the boot loader's cmd-db, once. Where the device tree gives the table itself that is one map;
+ * on SDM845 it gives a descriptor instead, whose two words are the table's address and length, so
+ * the table is mapped in two steps. Returning false says the descriptor did not answer usefully
+ * (zero address, an implausible length): the caller then reports "no such resource" rather than
+ * reading memory nobody described.
+ */
+static bool
+cmd_db_map(void)
+{
+	uint32_t phys = (uint32_t)CMD_DB_PHYS;
+
+	if (cmd_db != NULL) {
+		return true;
+	}
+	if (polaris) {
+		vm_offset_t descriptor = ml_io_map_wcomb(CMD_DB_DESCRIPTOR_PHYS, 8);
+		uint32_t start = rd(descriptor);
+		uint32_t length = rd(descriptor + 4);
+
+		if (start == 0 || length < 0x100 || length > 0x400000) {
+			printf("adreno: %u: the cmd-db descriptor at %#lx says %#x/%#x: no table to read\n", step,
+			    (unsigned long)CMD_DB_DESCRIPTOR_PHYS, start, length);
+			return false;
+		}
+		printf("adreno: %u: the cmd-db descriptor at %#lx says the table is at %#x, %#x long\n", step,
+		    (unsigned long)CMD_DB_DESCRIPTOR_PHYS, start, length);
+		phys = start;
+		cmd_db_size = length;
+	}
+	cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(phys, cmd_db_size);  /* memory, not registers */
+	return true;
+}
 
 /*
  * Where RPMh has a resource (0: nowhere) and, for a supply rail, the levels it knows: the GMU's
@@ -326,15 +406,16 @@ static const struct cmd_db_header *cmd_db;
 static uint32_t
 rpmh_resource(const char *name, uint16_t *levels, unsigned *level_count)
 {
-	const struct cmd_db_header *db = cmd_db;
+	const struct cmd_db_header *db;
 	char id[8] = { 0 };
 
 	if (level_count != NULL) {
 		*level_count = 0;
 	}
-	if (db == NULL) {
-		db = cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);  /* memory, not registers */
+	if (!cmd_db_map()) {
+		return 0;
 	}
+	db = cmd_db;
 	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
 	}
@@ -353,7 +434,7 @@ rpmh_resource(const char *name, uint16_t *levels, unsigned *level_count)
 			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
 				continue;
 			}
-			if ((unsigned)slave->data_offset + entry[i].offset + entry[i].length > CMD_DB_SIZE - 0x1000) {
+			if ((unsigned)slave->data_offset + entry[i].offset + entry[i].length > cmd_db_size - 0x1000) {
 				count = 0;
 			}
 			for (unsigned l = 0; levels != NULL && l < count && l < 16; l++) {
@@ -393,13 +474,30 @@ static bool
 step_outside(void)
 {
 	announce("read the GPU's clocks in the global clock controller (registers the touch screen driver uses too)");
+	if (polaris) {
+		printf("adreno: %u: SDM845: the GPU's branches in gcc are gpu_cfg_ahb, gpu_memnoc_gfx,\n", step);
+		printf("adreno: %u: gpu_snoc_dvm_gfx, ddrss_gpu_axi, plus the gpll0 vote; ddrss_gpu_axi is at\n", step);
+		printf("adreno: %u: 0x44038 here, not at the 0x71154 the sc7280 values in this file use\n", step);
+	}
 	get(&gcc, "pll votes", GCC_PLL_VOTE);
 	get(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR);
 	get(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR);
 	get(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR);
 	get(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR);
 
-	announce("look up the GPU's supply rails in the boot loader's list of RPMh resources (memory at 0x80860000)");
+	/*
+	 * The supply names. On SDM845 the device tree gives the GPU two GDSC-backed rails rather than
+	 * RPMh levels -- kgsl-3d0's regulator-names = "vddcx", "vdd" over gpu_cx_gdsc and gpu_gx_gdsc,
+	 * and qcom,gmu's vdd-supply on the same -- so what RPMh is asked for here is the levels the
+	 * GMU firmware votes on, not the 3D core's own supply. Those names are the ones the A630 GMU
+	 * code uses: a6xx_gmu_rpmh_read_arc() asks for "cx.lvl" (the CX half, shared with most of the
+	 * SoC), "gfx.lvl" (the 3D core) and "mx.lvl" (the memories), and optionally "gbx.lvl", which
+	 * only exists on later SoCs and is absent here. So the names below are right for polaris as
+	 * they stand; what was wrong was only where the table is, which cmd_db_map() now asks the
+	 * descriptor for.
+	 */
+	announce(polaris ? "look up the GPU's RPMh resources, the table being wherever the descriptor at 0x0c3f000c says"
+	    : "look up the GPU's supply rails in the boot loader's list of RPMh resources (memory at 0x80860000)");
 	show_rpmh_resource("gfx.lvl");          /* the 3D core's own rail (dt: VDD_GFX_LEVEL, PM8350C S7) */
 	show_rpmh_resource("cx.lvl");           /* the rail of the CX half, shared with most of the SoC */
 	show_rpmh_resource("mx.lvl");           /* memories */
@@ -413,11 +511,28 @@ step_outside(void)
  * (bit 5). Linux has the same cell 0x4000 further on, in the error-corrected copy of the fuses
  * (sc7280.dtsi: efuse@784000), and that is the copy it reads under this hypervisor on sibling
  * boards; so that one first.
+ *
+ * SDM845 is not this. The phone's own device tree has no qfprom, efuse or nvmem node anywhere in
+ * it: the polaris DTB was parsed node by node and there is none. What the mainline tree puts on
+ * this SoC is qfprom@784000, reg = <0 0x00784000 0 0x8ff> -- so the window below, 0x00780000 and
+ * 0x7000 long, is the wrong base and five times too long. 0x00780000 is in fact qcom,msm-core's
+ * register block (0x780000/0x1000, the APSS core EA), which reads back but is not fuses.
+ *
+ * So the polaris arm gets the window the SoC actually has, and then stops: the A630 speed bin is
+ * not at a fixed cell the way sc7280's is. a6xx_efuse_speed_bin() in the vendor tree reads the
+ * fuse location out of the device tree -- qcom,gpu-speed-bin, three cells (offset, mask, shift) --
+ * and the polaris device tree has no such property on kgsl-3d0. Without it there is no address to
+ * read and no mask to apply, and inventing one would be reporting a made-up GPU. The value is
+ * therefore not obtainable from anything present here; the TODO names what has to be found.
  */
 static struct block qfprom = { "qfprom", 0x00780000, 0x7000 };
 #define QFPROM_CORRECTED        0x4000
 #define QFPROM_GPU_SPEED_BIN    0x1e9
 #define QFPROM_GPU_GAMING_BIN   0x1f5
+
+/* SDM845: mainline sdm845.dtsi's qfprom@784000, and the window that is not fuses. */
+#define QFPROM_SDM845_PHYS      0x00784000
+#define QFPROM_SDM845_SIZE      0x8ff
 
 static uint32_t
 get8(struct block *b, const char *name, uint32_t offset)
@@ -446,6 +561,41 @@ step_fuses(void)
 		return true;
 	}
 
+	if (polaris) {
+		/*
+		 * Say what the SoC is by reading what the tree does describe, not by guessing a fuse.
+		 * The GPU's identity here is qcom,chipid = 0x06030001 on kgsl-3d0 (A630 v2), which the
+		 * device tree states outright; the fuses would only say which speed grade of it this
+		 * particular board got.
+		 */
+		announce("the device tree's own statement of which GPU this is (qcom,chipid)");
+		printf("adreno: %u: qcom,chipid 0x06030001: an Adreno 630, v2 (a630_catalog: 0x06030000/...01)\n", step);
+		printf("adreno: %u: qcom,gpu-quirk-hfi-use-reg, qcom,gpu-quirk-secvid-set-once, qcom,no-nap present;\n", step);
+		printf("adreno: %u: no qcom,gpu-speed-bin and no qcom,speed-bin on any gpu-pwrlevel: this board's\n", step);
+		printf("adreno: %u: device tree does not say where its fuses are\n", step);
+
+		need(&qfprom);
+		printf("adreno: %u: the fuse window is 0x%x, %#x long: mainline sdm845.dtsi's qfprom@784000,\n", step,
+		    qfprom.phys, qfprom.size);
+		printf("adreno: %u: because the polaris tree names no qfprom node at all and the old\n", step);
+		printf("adreno: %u: 0x780000/%#x in this file is qcom,msm-core@780000, the APSS core EA\n", step, 0x7000);
+		get8(&qfprom, "first byte", 0);
+
+		/*
+		 * TODO(polaris): the Adreno 630 GPU speed bin. Not obtainable from the device tree this
+		 * phone ships. It has to come from the MiCode polaris-o-oss kernel tree:
+		 *   drivers/gpu/msm/adreno_a6xx.c -- a6xx_efuse_speed_bin(), the cell it reads;
+		 *   and the SM845/SDM845 board dtsi's kgsl-3d0 node, for qcom,gpu-speed-bin = <off mask shift>.
+		 * Until then speed_bin stays 0, which every consumer of it in this file reads as "the one
+		 * ordinary configuration", and nothing downstream may treat it as a measurement.
+		 */
+		printf("adreno: %u: TODO(polaris): the A630 speed bin needs qcom,gpu-speed-bin from the\n", step);
+		printf("adreno: %u: polaris-o-oss tree (drivers/gpu/msm/adreno_a6xx.c, a6xx_efuse_speed_bin);\n", step);
+		printf("adreno: %u: the device tree here does not carry it, so speed_bin is left at 0 (unknown)\n", step);
+		speed_bin = 0;
+		return true;                    /* (a read that found nothing is not a failure) */
+	}
+
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -469,6 +619,26 @@ step_fuses(void)
  * dt: clock-controller@3d90000 (qcom,yupik-gpucc), 0x9000 long; offsets: gpucc-sc7280.c. Its
  * registers answer only while gcc_gpu_cfg_ahb runs, which Linux turns on for good when it
  * starts (gcc-sc7280.c, the end of the probe function).
+ *
+ * SDM845 (polaris): dt qcom,gpucc@5090000 and qcom,gfxcc@5090000, both reg = <0x5090000 0x9000>,
+ * compatibles qcom,gpucc-sdm845-v2 / qcom,gfxcc-sdm845-v2. Offsets from the vendor gpucc-sdm845.c,
+ * and they are the same ones this file already carries: pll0 at 0x0, pll1 at 0x100, cxo_aon
+ * 0x1004, gx_sw_reset 0x1008, gx_gdscr 0x100c, gx_gmu 0x1064, cx_gdscr 0x106c, ahb 0x1078,
+ * cx_gmu 0x1098, cxo 0x109c, gmu_clk_src 0x1120 -- and the two GDSC registers the device tree
+ * names, gpu_cx_gdsc at 0x509106c and gpu_cx_hw_ctrl at 0x5091540, i.e. +0x106c and +0x1540 here,
+ * plus gpu_gx_gdsc at 0x509100c (+0x100c).
+ *
+ * What is NOT this SoC's, and so is not read when polaris: everything in the `!a640` arm below.
+ * Those are sc7280's registers -- gpu_cc_cb_clk 0x1170, gpu_cc_hub_aon_clk 0x1178, gpu_cc_hub_clk_src
+ * 0x117c, gpu_cc_hub_cx_int_clk 0x1204, and gpu_cc_hlos1_vote_gpu_smmu_clk at 0x5000. None of the
+ * five exists in gpucc-sdm845.c (whose HLOS vote registers are not at 0x5000 either). Reading them
+ * would be reading a different block's registers, which is exactly what must not happen, so on
+ * polaris they are skipped rather than trusted.
+ *
+ * GPUCC_GX_DOMAIN_MISC likewise has no SDM845 value in the sources read: mainline gives gpu_gx_gdsc
+ * clamp_io_ctrl = 0x1508 and the vendor tree gives gpu_gx_gdsc only the 0x100c GDSCR, with no
+ * separate domain-misc register. Both the a640 arm (0x1508) and the sc7280 arm (0x158c) are other
+ * SoCs' values, so polaris reads neither and says so. See the TODO in step_gpucc().
  */
 static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_PLL0_MODE         0x0000          /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
@@ -482,6 +652,7 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_CX_GMU_CBCR       0x1098          /* gpu_cc_cx_gmu_clk: the GMU */
 #define GPUCC_CXO_CBCR          0x109c          /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
 #define GPUCC_GMU_RCGR          0x1120          /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
+#define GPUCC_GX_GFX3D_CBCR     0x1054          /* gpu_cc_gx_gfx3d_clk: the 3D core itself (sdm845 only, not read unless polaris) */
 #define GPUCC_CB_CBCR           0x1170          /* gpu_cc_cb_clk: Linux keeps it on always */
 #define GPUCC_HUB_AON_CBCR      0x1178          /* gpu_cc_hub_aon_clk */
 #define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
@@ -497,27 +668,45 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 static bool
 step_gpucc(void)
 {
-	announce("make sure the clock of the GPU clock controller's registers runs (gcc_gpu_cfg_ahb)");
-	if ((set(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR, CBCR_ENABLE) & CBCR_OFF) &&
-	    !wait_for(&gcc, GCC_GPU_CFG_AHB_CBCR, CBCR_OFF, 0, 10)) {
-		printf("adreno: %u: it stays off (%#x): the GPU's clock controller would not answer\n", step,
-		    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR));
-		return false;
+	/*
+	 * The sc7280 and sm8150 arms turn gcc_gpu_cfg_ahb on here to make the GPUCC registers
+	 * answer. That is a write, and on polaris nothing is written -- so instead read the branch
+	 * and go by what the boot loader left: if it is already running, the GPUCC reads below are
+	 * real reads; if it is off, they are not, and the step says so rather than switching it on.
+	 */
+	if (polaris) {
+		announce("read, not switch, the clock of the GPU clock controller's registers (gcc_gpu_cfg_ahb)");
+		need(&gcc);
+		printf("adreno: %u: gcc gpu_cfg_ahb (%#x) = %#x: %s; polaris does not write it on\n", step,
+		    GCC_GPU_CFG_AHB_CBCR, rd(gcc.base + GCC_GPU_CFG_AHB_CBCR),
+		    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR) & CBCR_OFF ? "off, so the reads that follow are not trustworthy"
+		    : "running, as the boot loader left it");
+	} else {
+		announce("make sure the clock of the GPU clock controller's registers runs (gcc_gpu_cfg_ahb)");
+		if ((set(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR, CBCR_ENABLE) & CBCR_OFF) &&
+		    !wait_for(&gcc, GCC_GPU_CFG_AHB_CBCR, CBCR_OFF, 0, 10)) {
+			printf("adreno: %u: it stays off (%#x): the GPU's clock controller would not answer\n", step,
+			    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR));
+			return false;
+		}
 	}
 
-	announce("read the GPU's clock controller (0x3d90000) as it is: the first access to the GPU's part of the SoC");
+	announce(polaris ? "read the GPU's clock controller (0x5090000) as the boot loader left it"
+	    : "read the GPU's clock controller (0x3d90000) as it is: the first access to the GPU's part of the SoC");
 	get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	get(&gpucc, "gx_sw_reset", GPUCC_GX_SW_RESET);
-	get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
+	if (!polaris) {
+		get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
+	}
 	get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
 	get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
 	get(&gpucc, "pll1 mode", GPUCC_PLL1_MODE);
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
-	if (!a640) {
+	if (!a640 && !polaris) {
 		get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
 		get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
 	}
@@ -526,11 +715,32 @@ step_gpucc(void)
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	if (!a640) {
+	if (polaris) {
+		/* the 3D core's own branch: sdm845's gpu_cc_gx_gfx3d_clk is at 0x1054 */
+		get(&gpucc, "gx_gfx3d", GPUCC_GX_GFX3D_CBCR);
+	} else if (!a640) {
 		get(&gpucc, "cb", GPUCC_CB_CBCR);
 		get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
 		get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
 		get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
+	}
+	if (polaris) {
+		/*
+		 * gpu_cx_gdsc has a hw-ctrl-addr (0x5091540) and no-status-check-on-disable; gpu_gx_gdsc
+		 * has neither, only qcom,poll-cfg-gdscr, so it reports its own state in its own GDSCR.
+		 */
+		const uint32_t cx = rd(gpucc.base + GPUCC_CX_GDSCR) | rd(gpucc.base + GPUCC_CX_HW_CTRL);
+		const uint32_t gx = rd(gpucc.base + GPUCC_GX_GDSCR);
+
+		printf("adreno: %u: CX is %s, GX is %s, as the boot loader left them; nothing here switched either\n", step,
+		    cx & GDSC_POWER_ON ? "on" : "off", gx & GDSC_POWER_ON ? "on" : "off");
+		printf("adreno: %u: TODO(polaris): GPUCC's gx domain-misc / clamp_io register has no SDM845 offset\n", step);
+		printf("adreno: %u: in the sources read (mainline: clamp_io_ctrl = 0x1508 on gpu_gx_gdsc; the vendor\n", step);
+		printf("adreno: %u: gpucc-sdm845.c: no such register). It is not read rather than guessed;\n", step);
+		printf("adreno: %u: get it from MiCode polaris-o-oss drivers/clk/qcom/gpucc-sdm845.c and\n", step);
+		printf("adreno: %u: drivers/gpu/msm/adreno_a6xx.c\n", step);
+		printf("adreno: %u: TODO(polaris): gpu_cc_hlos1_vote_gpu_smmu_clk is not at 0x5000 on SDM845;\n", step);
+		printf("adreno: %u: its offset has to come from the same gpucc-sdm845.c\n", step);
 	}
 	return true;
 }
@@ -569,6 +779,34 @@ step_cx_power(void)
 {
 	uint32_t gdscr;
 
+	/*
+	 * polaris: not implemented, deliberately, and it says so instead of doing something else.
+	 * This step switches on a power domain and then votes for a rail in RPMh; both are writes.
+	 * The values it would need -- the CX level list from "cx.lvl", the collapse/hw-ctrl dance as
+	 * gdsc-regulator.c does it on SDM845, the SMMU's and the GMU's clocks rising in the right
+	 * order, and the power-on sequence the PDC/RSC sequencer expects -- are the parts of the
+	 * bring-up that go wrong silently and hang a board. None of them has been established for
+	 * polaris, and the 3D core's power does not come on without them.
+	 *
+	 * Reporting false here stops the ladder at step 4, which is the intent: every step after it
+	 * (5 clocks, 6 the GMU's first words, 7, 10 the GMU's memory) needs the CX half powered, so
+	 * nothing beyond step 3 can be measured on this board yet, and pretending otherwise by
+	 * writing raphael's or redwood's addresses would be how the phone is hung.
+	 */
+	if (polaris) {
+		announce("stop: switching the CX half of the GPU block on is not implemented for polaris");
+		printf("adreno: %u: NOT IMPLEMENTED FOR POLARIS: gpu_cx_gdsc would have to be collapsed-off\n", step);
+		printf("adreno: %u: and the cx.lvl rail voted for; both are writes, and the SDM845 sequence\n", step);
+		printf("adreno: %u: (gdsc-regulator.c's hw-ctrl handshake, the PDC/RSC power-on, the order the\n", step);
+		printf("adreno: %u: GMU's and the SMMU's clocks come up in) has not been established here\n", step);
+		printf("adreno: %u: Writes made to raphael's or redwood's addresses would be another SoC's\n", step);
+		printf("adreno: %u: registers: this step refuses instead of doing that\n", step);
+		printf("adreno: %u: TODO(polaris): from MiCode polaris-o-oss, drivers/gpu/msm/adreno_a6xx.c\n", step);
+		printf("adreno: %u: (a6xx_gmu_resume / a6xx_cx_power) and drivers/clk/qcom/gdsc.c\n", step);
+		printf("adreno: %u: step 4 refuses; the ladder goes on to the read steps that do not need CX\n", step);
+		step_refused = true;
+		return false;
+	}
 	if (!gpucc_answers()) {
 		return false;
 	}
@@ -667,6 +905,32 @@ static bool measure_clocks(void);
 static bool
 step_clocks(void)
 {
+	/*
+	 * polaris: not implemented. Every line below is a write -- two clock branches in gcc, a PLL
+	 * vote, five clock sources and seven enable bits in GPUCC -- and it is the clock plan that
+	 * sc7280 and sm8150 use, not SDM845's. On SDM845 the "hub" clocks this file drives
+	 * (hub_clk_src, hub_aon, hub_cx_int) and the gpu_cc_hlos1 SMMU vote are not registers of
+	 * this block at all (see step 3), so the sequence would write another controller's space.
+	 * Refused, not attempted.
+	 *
+	 * If step 4 ever gets implemented this step has to be rewritten from gpucc-sdm845.c, the
+	 * GMU's clock tree (gpu_cc_gmu_clk_src 0x1120, its parent gpu_cc_pll1 at 0x100, and the
+	 * CX/GFX branches) and the rates a6xx_gmu_resume() asks for on A630.
+	 */
+	if (polaris) {
+		announce("stop: the clocks of the GMU, the 3D core and the SMMU are not implemented for polaris");
+		printf("adreno: %u: NOT IMPLEMENTED FOR POLARIS: step 5 switches clock sources and enable\n", step);
+		printf("adreno: %u: bits in gcc and in GPUCC; every one of those is a write\n", step);
+		printf("adreno: %u: the clock tree it drives is sc7280's: hub_clk_src (0x117c), hub_aon\n", step);
+		printf("adreno: %u: (0x1178), hub_cx_int (0x1204) and the SMMU vote at 0x5000 are not\n", step);
+		printf("adreno: %u: registers of SDM845's GPU clock controller\n", step);
+		printf("adreno: %u: TODO(polaris): the rates and sources from MiCode polaris-o-oss\n", step);
+		printf("adreno: %u: drivers/gpu/msm/adreno_a6xx.c (a6xx_gmu_resume) and\n", step);
+		printf("adreno: %u: drivers/clk/qcom/gpucc-sdm845.c\n", step);
+		printf("adreno: %u: step 5 refuses; the ladder goes on to the read steps that do not need it\n", step);
+		step_refused = true;
+		return false;
+	}
 	if (!gpucc_answers()) {
 		return false;
 	}
@@ -904,6 +1168,21 @@ cx_ready(void)
 
 /*
  * dt: qcom,gmu "kgsl_gmu_reg" at 0x3d6a000, 0x34000 long. Offsets in a6xx_gmu.xml are in words.
+ *
+ * SDM845 (polaris) is the same layout and the same word offsets -- this is checked, not assumed:
+ * a6xx_gmu.xml (and the vendor a6xx_reg.h) give CM3_ITCM_START 0x1B400, CM3_DTCM_START 0x1C400,
+ * CM3_SYSRESET 0x1F800, CM3_BOOT_CONFIG 0x1F801, CM3_FW_INIT_RESULT 0x1F81C, CM3_CFG 0x1F82D,
+ * ALWAYS_ON_COUNTER_L/H 0x1F888/0x1F889, SPTPRAC_PWR_CLK_STATUS 0x1F8D0, RPMH_POWER_STATE 0x1F8EC,
+ * HFI_CTRL_STATUS/VERSION_INFO 0x1F980/0x1F981, GENERAL_7 0x1F9CC, AO_HOST_INTERRUPT_STATUS
+ * 0x23B05, RSCC_CONTROL_ACK 0x23B08, AO_GPU_CX_BUSY_STATUS 0x23B0C, AHB_FENCE_STATUS 0x23B13 --
+ * every one of which is exactly the GMU_WORD() value below. The registers are word offsets from
+ * the GPU's own base, which is why GMU_BYTE_OFFSET() in the vendor a6xx_gmu.h subtracts an
+ * mmio_offset rather than the GMU window's own start; here the GMU window is mapped at 0x506a000
+ * and the offsets below are relative to it, matching gmu_read(gmu, REG_A6XX_...) there.
+ *
+ * What differs is only the window: dt qcom,gmu's kgsl_gmu_reg is 0x0506a000, 0x30000 long (not
+ * the 0x3d6a000/0x34000 of sc7280), which the init branch sets. So step 6 needs no change of
+ * offsets at all -- only the permission to run without CX powered, below.
  */
 static struct block gmu = { "gmu", 0x03d6a000, 0x34000 };
 #define GMU_WORD(n)             (4u * (n))
@@ -930,6 +1209,12 @@ static struct block gmu = { "gmu", 0x03d6a000, 0x34000 };
  * gives it) not to be touched -- except its bus interface ("GBIF", words 0x3c00 on in a6xx.xml),
  * which is in the CX half: the vendor's driver writes GBIF_HALT before it starts the GMU.
  * "cx_misc" at 0x3d9e000 is a page of odds and ends in the CX half.
+ *
+ * SDM845: the same layout at the SoC's own addresses, both from the polaris device tree --
+ * kgsl_3d0_reg_memory 0x05000000/0x40000, so GBIF is 0x05000000 + 4*0x3c00 = 0x0500f000, and
+ * "cx_misc" is 0x0509e000/0x1000. The init branch sets both. The word offsets (GBIF at 0x3c00)
+ * come from a6xx.xml and are the same for A630; the vendor tree's a6xx_reg.h carries the same
+ * numbers, so they are read here as they stand.
  */
 static struct block gbif = { "gbif", 0x03d00000 + 4 * 0x3c00, 0x1000 };
 #define GBIF_SCACHE_CNTL0       (4 * 0x01)
@@ -945,10 +1230,34 @@ step_first_words(void)
 	uint64_t start, nanos;
 	uint32_t before, hz;
 
-	if (!cx_ready()) {
+	/*
+	 * Every other board reaches this step through cx_ready(), which insists that step 4 has
+	 * powered CX and step 5 has the GMU's clock running -- because those boards go on to load
+	 * firmware and start the core. polaris does neither: steps 4, 5 and 10 refuse, so CX is
+	 * whatever the boot loader left it as, and asking cx_ready() here would make this step
+	 * unreachable for a reason that is not about reading.
+	 *
+	 * Reading is still allowed, and it is the whole point of this port: a load from an unmapped
+	 * or unclocked register returns zero or raises, but it changes nothing. The mapped window is
+	 * the GMU's, already reserved by the device tree for this GPU, so nothing else in the system
+	 * owns it. If the block is unpowered the words come back 0 and step 6 says so plainly --
+	 * a reported zero is a result, a guessed value is not.
+	 */
+	if (polaris) {
+		announce("read registers of the GMU (0x506a000) as the boot loader left them; nothing is powered or started here");
+		printf("adreno: %u: CX was not switched on by step 4 (it is not implemented for polaris); these\n", step);
+		printf("adreno: %u: reads are of whatever the boot loader left, and a word of 0 means no power\n", step);
+		if (gpucc_answers()) {
+			printf("adreno: %u: for the record: CX %s, cx_gmu %#x, gcc gpu_cfg_ahb %#x\n", step,
+			    cx_is_on() ? "on" : "off", rd(gpucc.base + GPUCC_CX_GMU_CBCR),
+			    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR));
+		}
+	} else if (!cx_ready()) {
 		return false;
 	}
-	announce("read registers of the GMU (0x3d6a000): the first words from the GPU block itself");
+	if (!polaris) {
+		announce("read registers of the GMU (0x3d6a000): the first words from the GPU block itself");
+	}
 	get(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET);
 	get(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG);
 	get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
@@ -1030,6 +1339,29 @@ rscc_show(void)
 static bool
 step_rscc(void)
 {
+	/*
+	 * polaris: refused. The window this step reads (0x3de0000 on sc7280, 0x2c8d000 on raphael) is
+	 * a separate RSC/RSCC block on those SoCs. The polaris device tree has no such node for the
+	 * GPU: what it has is kgsl_gmu_pdc_reg at 0x0b200000, the PDC half of the sequencer, and on
+	 * A6xx the GMU's RSC registers are inside the GMU window itself (a6xx_gmu.h maps gmu->rscc
+	 * at gmu->mmio + 0x23000). Reading another SoC's address, or a guessed offset inside the GMU
+	 * window, would be inventing what this step is supposed to observe.
+	 * TODO(polaris): the A630 RSC/PDC offsets from MiCode polaris-o-oss
+	 * drivers/gpu/msm/adreno_a6xx.c (_load_gmu_rpmh_ucode) and a6xx_gmu.xml's A6XX_RSCC domain.
+	 */
+	if (polaris) {
+		announce("stop: the GMU's RPMh sequencer is not implemented for polaris");
+		printf("adreno: %u: NOT IMPLEMENTED FOR POLARIS: there is no separate rscc window for the GPU\n", step);
+		printf("adreno: %u: in this phone's device tree. kgsl_gmu_pdc_reg is 0x0b200000/%#x (the PDC\n", step,
+		    0x300000);
+		printf("adreno: %u: half), and on A6xx the GMU's RSC registers sit inside the GMU window at\n", step);
+		printf("adreno: %u: gmu->mmio + 0x23000, whose SDM845 offsets have not been established here\n", step);
+		printf("adreno: %u: TODO(polaris): MiCode polaris-o-oss drivers/gpu/msm/adreno_a6xx.c\n", step);
+		printf("adreno: %u: (_load_gmu_rpmh_ucode) and a6xx_gmu.xml's A6XX_RSCC domain\n", step);
+		printf("adreno: %u: step 7 refuses; nothing is read at raphael's 0x2c8d000\n", step);
+		step_refused = true;
+		return false;
+	}
 	if (!cx_ready()) {
 		return false;
 	}
@@ -1050,6 +1382,25 @@ step_rscc(void)
  * the vendor's driver leaves its stream table as it finds it. Its streams (dt: qcom,kgsl-iommu
  * and qcom,gmu, "iommus"): 0 the GPU, 1 its low-priority twin, 2 secure content, 5 the GMU.
  * The global registers here are the ones the hypervisor imitates; offsets: arm-smmu.h.
+ *
+ * SDM845 (polaris): dt arm,smmu-kgsl@5040000, compatible qcom,kgsl-smmu-v2 (not qsmmu-v500),
+ * reg = <0x05040000 0x10000>, with qcom,smmu-v2, qcom,use-3-lvl-tables, qcom,disable-atos,
+ * #global-interrupts = 2, qcom,micro-mmu-control = <0x6000>, qcom,secure_align_mask = <0xfff>
+ * and twelve attach-impl-defs pairs. The stream numbers are NOT the same as sc7280's, and this
+ * is the one place where the difference would silently mislead: sdm845-gpu.dtsi gives
+ *
+ *	gfx3d_user   iommus = <&kgsl_smmu 0>        the 3D core
+ *	gfx3d_secure iommus = <&kgsl_smmu 2>, <&kgsl_smmu 1>   secure content (two streams)
+ *	gmu_user     iommus = <&kgsl_smmu 4>        the GMU's user context
+ *	gmu_kernel   iommus = <&kgsl_smmu 5>        the GMU's kernel context
+ *
+ * so the GMU is streams 4 and 5 here, not 5 alone, and gfx3d_user carries qcom,gpu-offset =
+ * <0x48000>. The stream table is read whole rather than by index, so the numbers come out of the
+ * hardware; the table below is what those reads are then matched against.
+ *
+ * Offsets: arm-smmu.h, and they are the same for an MMU-500 in either SoC -- GR0_sCR0 0x0,
+ * GR0_sGFSR 0x48, GR0_SMR(n) 0x800+4n, GR0_S2CR(n) 0xc00+4n, GR1_CBAR(n) 4n, CB_SCTLR 0x0,
+ * CB_TTBR0 0x20, CB_TCR 0x30, CB_FSR 0x58.
  */
 static struct block smmu = { "smmu", 0x03da0000, 0x20000 };
 #define SMMU_SCR0               0x000
@@ -1066,6 +1417,13 @@ static struct block smmu = { "smmu", 0x03da0000, 0x20000 };
 #define SMMU_CB_TCR             0x30
 #define SMMU_CB_FSR             0x58
 
+/* SDM845's streams, from the phone's own device tree (see above). */
+#define SDM845_STREAM_GFX3D_USER    0
+#define SDM845_STREAM_GFX3D_SECURE  2
+#define SDM845_STREAM_GFX3D_SECURE2 1
+#define SDM845_STREAM_GMU_USER      4
+#define SDM845_STREAM_GMU_KERNEL    5
+
 static uint32_t smmu_page, smmu_pages, smmu_contexts, smmu_matches;
 
 /* The layout of the SMMU's register space from its ID registers; false if it is not what the device tree says. */
@@ -1080,6 +1438,25 @@ smmu_layout(void)
 	smmu_matches = idr0 & 0xff;
 	printf("adreno: %u: SMMU: %u stream match registers, %u contexts, %u pages of %#x before the contexts' own\n", step,
 	    smmu_matches, smmu_contexts, smmu_pages, smmu_page);
+	if (polaris) {
+		/*
+		 * SDM845's window is 0x10000, where sc7280's is 0x20000, so the exact-equality test below
+		 * would reject a perfectly ordinary MMU-500 layout. What matters is that the contexts
+		 * are inside the window that was mapped -- reading past it would be reading whatever
+		 * follows the SMMU, which is not ours. So the test is containment, and a window larger
+		 * than the layout needs is reported, not refused.
+		 */
+		if (2 * smmu_pages * smmu_page > smmu.size) {
+			printf("adreno: %u: that makes %#x of registers, more than the %#x mapped: not reading further\n", step,
+			    2 * smmu_pages * smmu_page, smmu.size);
+			return false;
+		}
+		if (2 * smmu_pages * smmu_page < smmu.size) {
+			printf("adreno: %u: that makes %#x of registers inside the %#x the device tree gives\n", step,
+			    2 * smmu_pages * smmu_page, smmu.size);
+		}
+		return true;
+	}
 	if (2 * smmu_pages * smmu_page != smmu.size) {
 		printf("adreno: %u: that makes %#x of registers, the device tree says %#x: not reading further\n", step,
 		    2 * smmu_pages * smmu_page, smmu.size);
@@ -1091,10 +1468,23 @@ smmu_layout(void)
 static bool
 step_smmu(void)
 {
-	if (!cx_ready()) {
-		return false;
+	/*
+	 * polaris reads this without CX powered, for the same reason step 6 does: the window is the
+	 * GPU's own (0x05040000/0x10000, reserved by the device tree), a load changes nothing, and
+	 * what the SMMU's ID registers say about the hardware does not depend on our powering it.
+	 * If the block is unpowered the reads come back 0, and the layout check below will say so.
+	 */
+	if (polaris) {
+		announce("read the ID registers of the GPU's SMMU (0x5040000), as the boot loader left it");
+		printf("adreno: %u: this SMMU is qcom,kgsl-smmu-v2 (an MMU-500) at 0x5040000, %#x long, with\n", step,
+		    smmu.size);
+		printf("adreno: %u: use-3-lvl-tables, disable-atos and micro-mmu-control = 0x6000\n", step);
+	} else {
+		if (!cx_ready()) {
+			return false;
+		}
+		announce("read the ID registers of the GPU's SMMU (0x3da0000): global registers, which the hypervisor answers for");
 	}
-	announce("read the ID registers of the GPU's SMMU (0x3da0000): global registers, which the hypervisor answers for");
 	if (!smmu_layout()) {
 		return false;
 	}
@@ -1111,6 +1501,22 @@ step_smmu(void)
 	for (uint32_t i = 0; i < smmu_contexts && i < 16; i++) {
 		get(&smmu, "cbar", smmu_page + SMMU_CBAR(i));
 	}
+	if (polaris) {
+		/*
+		 * Name what the device tree says each of these streams is, so the numbers above can be
+		 * read against something. The mapping is from sdm845-gpu.dtsi's iommus; the values are
+		 * the hardware's, read a moment ago.
+		 */
+		printf("adreno: %u: dt: stream %u gfx3d_user (the 3D core), %u/%u gfx3d_secure, %u gmu_user, %u gmu_kernel\n",
+		    step, SDM845_STREAM_GFX3D_USER, SDM845_STREAM_GFX3D_SECURE, SDM845_STREAM_GFX3D_SECURE2,
+		    SDM845_STREAM_GMU_USER, SDM845_STREAM_GMU_KERNEL);
+		if (smmu_matches > SDM845_STREAM_GMU_KERNEL) {
+			for (unsigned s = 0; s < 6; s++) {
+				printf("adreno: %u: stream %u: smr %#x, s2cr %#x\n", step, s,
+				    rd(smmu.base + SMMU_SMR(s)), rd(smmu.base + SMMU_S2CR(s)));
+			}
+		}
+	}
 	return true;
 }
 
@@ -1123,10 +1529,19 @@ step_smmu_context(void)
 {
 	uint32_t context;
 
-	if (!cx_ready()) {
-		return false;
+	if (polaris) {
+		/*
+		 * Context 0 is the 3D core's (gfx3d_user is stream 0, and the vendor's driver gives it
+		 * context 0). Read only: no TTBR or SCTLR is written here, and none will be until the
+		 * steps that build a translation context are implemented for this SoC.
+		 */
+		announce("read translation context 0 of the SMMU (the 3D core's), as the boot loader left it");
+	} else {
+		if (!cx_ready()) {
+			return false;
+		}
+		announce("read translation context 0 of the SMMU: registers of the hardware itself, not the hypervisor's");
 	}
-	announce("read translation context 0 of the SMMU: registers of the hardware itself, not the hypervisor's");
 	if (!smmu_layout()) {
 		return false;
 	}
@@ -1136,6 +1551,12 @@ step_smmu_context(void)
 	get(&smmu, "cb0 ttbr0, high", context + SMMU_CB_TTBR0 + 4);
 	get(&smmu, "cb0 tcr", context + SMMU_CB_TCR);
 	get(&smmu, "cb0 fsr", context + SMMU_CB_FSR);
+	if (polaris) {
+		const uint32_t sctlr = rd(smmu.base + context + SMMU_CB_SCTLR);
+
+		printf("adreno: %u: context 0 translation is %s; this is what the boot loader left, nothing was written\n",
+		    step, sctlr & 1u ? "on" : "off");
+	}
 	return true;
 }
 
@@ -1152,6 +1573,31 @@ step_gmu_memory(void)
 	static const uint32_t pattern[2] = { 0x600d0001, 0x0a110002 };
 	uint32_t was[2], back[2];
 
+	/*
+	 * polaris: refused, and it is the most important refusal in this file after step 4.
+	 * This step puts the GMU's processor into reset and then writes into its data memory. Doing
+	 * that to a block that is not powered (which is the state on this board, since step 4 is not
+	 * implemented) is a write to a clocked-off peripheral; doing it with SDM845's offsets, which
+	 * for the DTCM are the same ones below, would additionally be a write into the memory the
+	 * boot loader's own firmware may be using. Neither is a read, and neither is this port's job.
+	 * The register offsets themselves are right for A630 (see step 6); what is missing is the
+	 * power and reset sequence around them.
+	 * TODO(polaris): a6xx_gmu_fw_load() and a6xx_gmu_fw_start() in MiCode polaris-o-oss
+	 * drivers/gpu/msm/adreno_a6xx.c, plus the GMU firmware image a630_gmu.bin.
+	 */
+	if (polaris) {
+		announce("stop: writing into the GMU's memory is not implemented for polaris");
+		printf("adreno: %u: NOT IMPLEMENTED FOR POLARIS: this step resets the GMU's processor and\n", step);
+		printf("adreno: %u: writes into its data memory; both are writes, and the GMU is not powered\n", step);
+		printf("adreno: %u: here because step 4 is not implemented\n", step);
+		printf("adreno: %u: the DTCM offsets are the same on A630 as below (a6xx_gmu.xml 0x1C400),\n", step);
+		printf("adreno: %u: so the offsets are not the problem -- the reset and power sequence is\n", step);
+		printf("adreno: %u: TODO(polaris): MiCode polaris-o-oss drivers/gpu/msm/adreno_a6xx.c\n", step);
+		printf("adreno: %u: (a6xx_gmu_fw_load, a6xx_gmu_fw_start) and fw a630_gmu.bin\n", step);
+		printf("adreno: %u: step 10 refuses; no register of the GMU is written\n", step);
+		step_refused = true;
+		return false;
+	}
 	if (!cx_ready()) {
 		return false;
 	}
@@ -3101,6 +3547,15 @@ gx_off(void)
 {
 	uint32_t gx = get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 
+	if (polaris) {
+		/*
+		 * The 3D core's power switch is not ours to operate on this board: nothing here turned
+		 * it on, and switching off a core somebody else started is not a read. Report only.
+		 */
+		printf("adreno: %u: GX (the 3D core) is %s; polaris does not switch it, having never started it\n", step,
+		    gx & GDSC_POWER_ON ? "on" : "off");
+		return;
+	}
 	if (gx & GDSC_POWER_ON) {
 		put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, gx | GDSC_SW_COLLAPSE);
 		wait_for(&gpucc, GPUCC_GX_GDSCR, GDSC_POWER_ON, 0, 100);
@@ -3112,6 +3567,22 @@ gx_off(void)
 static void
 stale_stop(void)
 {
+	if (polaris) {
+		/*
+		 * Every line of this function is a write, and they are the writes that take the GPU
+		 * block down: the GMU into reset, the 3D core's power off, the SMMU's streams to fault,
+		 * the CX half collapsed. On polaris none of it was started by this kernel, so none of
+		 * it is ours to stop -- and on a block whose power sequence is not implemented, doing
+		 * it blind is how a board hangs. It says what it sees and does nothing.
+		 */
+		printf("adreno: %u: polaris: not stopping a GPU block this kernel did not start; nothing is written\n", step);
+		need(&gmu);
+		need(&gpucc);
+		printf("adreno: %u: cm3_sysreset %#x, cm3_fw_init_result %#x, gx_gdscr %#x, cx_gdscr %#x\n", step,
+		    rd(gmu.base + GMU_CM3_SYSRESET), rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
+		    rd(gpucc.base + GPUCC_GX_GDSCR), rd(gpucc.base + GPUCC_CX_GDSCR));
+		return;
+	}
 	need(&gmu);
 	need(&rscc);
 	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
@@ -3151,6 +3622,13 @@ stale_stop(void)
 static void
 core_bus_halt(bool for_good)
 {
+	if (polaris) {
+		/* a halt is a write to the bus interface; report what it reads and leave it alone */
+		need(&gbif);
+		printf("adreno: %u: polaris: not halting the GPU block's bus (nothing was started); halt %#x, ack %#x\n", step,
+		    rd(gbif.base + GBIF_HALT), rd(gbif.base + GBIF_HALT_ACK));
+		return;
+	}
 	if (for_good) {
 		wr(gpu.base + RBBM_GBIF_HALT, 1);
 		for (int i = 0; i < 100000 && !(rd(gpu.base + RBBM_GBIF_HALT_ACK) & 1); i++) {
@@ -3177,6 +3655,27 @@ gpu_block_stop(void)
 
 	step = 0;
 	newest_step = ~0u;
+	/*
+	 * polaris: nothing to stop, because nothing was started. Steps 4, 5, 10 and everything from
+	 * 11 on refused, so this kernel switched nothing on and started nothing -- the GPU block is
+	 * as the boot loader left it, which is exactly the state the next kernel should find. Every
+	 * line of the rest of this function is a write (the GMU told to slumber, the bus halted, the
+	 * SMMU's streams torn down, the CX half collapsed); performing any of them here would be
+	 * undoing somebody else's state, on a block whose power sequence is not implemented. So it
+	 * reports what it found and returns.
+	 */
+	if (polaris) {
+		printf("adreno: %u: polaris: read-only run over; the GPU block is left as the boot loader had it\n", step);
+		if (gpucc_answers()) {
+			printf("adreno: %u: CX %s (cx_gdscr %#x, cx_hw_ctrl %#x), GX %s (gx_gdscr %#x)\n", step,
+			    cx_is_on() ? "on" : "off", rd(gpucc.base + GPUCC_CX_GDSCR), rd(gpucc.base + GPUCC_CX_HW_CTRL),
+			    rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON ? "on" : "off", rd(gpucc.base + GPUCC_GX_GDSCR));
+		}
+		printf("adreno: %u: %u step(s) refused as not implemented for polaris; nothing was written to\n", step,
+		    refused_count);
+		printf("adreno: %u: any GPU, GMU, GPUCC or SMMU register in this run\n", step);
+		return;
+	}
 	if (core_runs && core_is_on) {
 		/* (what the core looks like when it is given back: a GMU that then does not answer may have its reasons here) */
 		printf("adreno: %u: the 3D core before it is stopped: status %#x, interrupts %#x, ring read up to %u of %u; the GMU "
@@ -3266,6 +3765,10 @@ gpu_block_stop(void)
 void
 hakios_adreno_quiesce(void)
 {
+	if (polaris) {
+		/* nothing of this kernel's runs in the GPU block; there is nothing to quiet */
+		return;
+	}
 	if (cx_off) {
 		return;
 	}
@@ -4047,14 +4550,33 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	const char *const files[] = { a640 ? "a640_gmu.bin" : "a660_gmu.bin",
-		a640 ? "a630_sqe.fw" : "a660_sqe.fw", a640 ? "a640_zap.mdt" : "a660_zap.mdt",
-		a640 ? "a640_zap.b02" : "a660_zap.b02" };
+	/*
+	 * The A630's firmware, from the phone's own /vendor/firmware: a630_gmu.bin (the GMU's
+	 * firmware, no .bcms -- A630 does no bus scaling), a630_sqe.fw (the 3D core's microcode),
+	 * a630_zap.mdt/.b02 (the signed zap shader; dt qcom,kgsl-hyp says qcom,firmware-name =
+	 * "a630_zap", qcom,pas-id = <13>). The redwood/sm8150 names are another chip's images and
+	 * would be rejected by TrustZone or, worse, accepted and then wrong.
+	 */
+	const char *const files[] = { polaris ? "a630_gmu.bin" : a640 ? "a640_gmu.bin" : "a660_gmu.bin",
+		polaris ? "a630_sqe.fw" : a640 ? "a630_sqe.fw" : "a660_sqe.fw",
+		polaris ? "a630_zap.mdt" : a640 ? "a640_zap.mdt" : "a660_zap.mdt",
+		polaris ? "a630_zap.b02" : a640 ? "a640_zap.b02" : "a660_zap.b02" };
 	const char *missing = NULL;
 	uint64_t size;
 
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
+		return false;
+	}
+	/*
+	 * polaris cannot start the GPU at all yet -- steps 4, 5, 10 and 11 upward refuse -- so gpu=1
+	 * would ask for something this port does not do. Say that plainly instead of failing later
+	 * on a missing firmware file or, worse, getting partway.
+	 */
+	if (polaris) {
+		printf("adreno: THE GPU IS NOT STARTED: starting the GPU is not implemented for polaris (SDM845,\n");
+		printf("adreno: Adreno 630). The read-only steps 1-3, 6, 8 and 9 report what the GPU is; use\n");
+		printf("adreno=N on its own to run them, not gpu=1\n");
 		return false;
 	}
 	image_asked_quietly = true;
@@ -4090,6 +4612,7 @@ hakios_adreno_init(void)
 	bool by_itself = false;
 
 	a640 = hakios_is_raphael();
+	polaris = hakios_is_polaris();
 	if (a640) {
 		gpu.phys = 0x02c00000;
 		gpucc.phys = 0x02c90000;
@@ -4127,11 +4650,32 @@ hakios_adreno_init(void)
 		gpucc.phys = 0x05090000;
 		gmu.phys = 0x0506a000;
 		gmu.size = 0x30000;
+		/*
+		 * GBIF is not its own node in this tree: it is the 3D core window's bus interface, at
+		 * word 0x3c00 of a6xx.xml, i.e. 0x05000000 + 0xf000. The default in this file is the
+		 * same arithmetic on sc7280's base, so polaris only needs its own base here.
+		 */
+		gbif.phys = 0x05000000 + 4 * 0x3c00;
 		cx_misc.phys = 0x0509e000;
 		smmu.phys = 0x05040000;
 		smmu.size = 0x10000;
 		pdc.phys = 0x0b200000;
 		pdc.size = 0x300000;
+		/*
+		 * rscc is deliberately left alone. sc7280 has a node for it; the polaris tree has
+		 * kgsl_gmu_pdc_reg 0x0b200000/0x300000 (the PDC sequencer) but no RSC/RSCC window for
+		 * the GPU, and a6xx_gmu.h maps rscc at gmu->mmio + 0x23000 on A6xx -- i.e. inside the
+		 * GMU window that is already mapped above, not at a separate address. Step 7 refuses
+		 * rather than reading raphael's 0x02c8d000 or a guessed offset.
+		 */
+		/*
+		 * Not the 0x780000/0x7000 the file carries for sc7280: that is msm-core here. The
+		 * SoC's fuses are mainline sdm845.dtsi's qfprom@784000, 0x8ff long. The phone's own
+		 * tree has no such node, so this is the SoC's address, not this board's -- step 2 says
+		 * so and reads only the first byte, to prove whether it answers.
+		 */
+		qfprom.phys = QFPROM_SDM845_PHYS;
+		qfprom.size = QFPROM_SDM845_SIZE;
 	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
@@ -4170,7 +4714,34 @@ hakios_adreno_init(void)
 		if (skip_steps & 1u << step) {
 			continue;
 		}
+		/*
+		 * polaris is read-only, and this is where that is enforced. Steps 1 to 10 are the reads
+		 * (with 4, 5 and 10 refusing, as their own code says); everything from step 11 on is the
+		 * bring-up -- TrustZone calls, page tables, firmware into the GMU, the 3D core started
+		 * and given commands. None of that has been established for this SoC, and all of it
+		 * writes. The guard is here, in the one place every step passes through, rather than in
+		 * each of a dozen functions, so that it cannot be forgotten in one of them.
+		 */
+		if (polaris && step > 10) {
+			printf("adreno: step %u: NOT IMPLEMENTED FOR POLARIS: %s; the read-only ladder ends at step 10\n", step,
+			    step < STEPS ? what[step] : "beyond the last step");
+			refused_count++;
+			continue;
+		}
+		step_refused = false;
 		if (!steps[step - 1]()) {
+			/*
+			 * A refusal is not a failure. A step that declines because it is not implemented
+			 * for this SoC has said so in its own words; the ladder notes it and carries on,
+			 * because the read steps after it are the reason the port exists. A step that
+			 * tried and could not goes on meaning what it always meant: the ladder stops,
+			 * since everything after it would be built on something that is not there.
+			 */
+			if (step_refused) {
+				refused_count++;
+				printf("adreno: step %u: refused (not implemented for this SoC); going on to the next\n", step);
+				continue;
+			}
 			printf("adreno: step %u: FAILED; the steps after it are not attempted\n", step);
 			failed = step;
 			break;
