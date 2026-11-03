@@ -37,10 +37,26 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -qq
+          # llvm is required, not optional: Mu-Silicium's BootShim Makefile runs
+          # `llvm-objcopy -O binary`, and without it the build dies with
+          # "make: llvm-objcopy: No such file or directory ... Error 127".
+          # setup_env.sh is supposed to provide the toolchain but does not put this on PATH.
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential uuid-dev iasl nasm python3 python3-venv python3-pip \
-            git ca-certificates curl xz-utils
+            git ca-certificates curl xz-utils llvm
           python3 --version
+          # The unversioned name is what the Makefile calls; some images only ship the
+          # versioned one, so make the link if it is missing.
+          if ! command -v llvm-objcopy >/dev/null 2>&1; then
+            found=$(ls /usr/lib/llvm-*/bin/llvm-objcopy 2>/dev/null | head -1)
+            test -n "$found" || { echo "no llvm-objcopy anywhere"; exit 1; }
+            echo "linking $found -> /usr/local/bin/llvm-objcopy"
+            sudo ln -sf "$found" /usr/local/bin/llvm-objcopy
+          fi
+          llvm-objcopy --version
+          clang --version | head -1 || true
+          # BootShim also calls clang and llvm-objcopy together; confirm the pair resolves.
+          for t in clang llvm-objcopy make; do command -v $t || { echo "missing tool: $t"; exit 1; }; done
 
       - name: Clone Mu-Silicium and its submodules
         run: |
@@ -111,14 +127,31 @@ jobs:
 
       - name: Build polaris
         run: |
-          set -e
+          set -euo pipefail
           cd "$RUNNER_TEMP/Mu-Silicium"
           export PATH="$PWD:$PATH"
           python3 -m pip install --quiet --break-system-packages -r pip-requirements.txt || \
             python3 -m pip install --quiet -r pip-requirements.txt
-          python3 build_uefi.py -d polaris 2>&1 | tail -100
+          # No pipe to tail: `build_uefi.py | tail` reports tail's exit status, so a build that
+          # died still showed a green step. That happened -- the run reported "Build polaris
+          # success" while the log said "make: llvm-objcopy: No such file or directory ...
+          # Error 127" and no volume was produced. The output goes to a file and is echoed
+          # afterwards, so the exit status that decides the step is the build's own.
+          set +e
+          python3 build_uefi.py -d polaris > "$RUNNER_TEMP/build.log" 2>&1
+          rc=$?
+          set -e
+          echo "build_uefi.py exit code: $rc"
+          tail -120 "$RUNNER_TEMP/build.log"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::build_uefi.py failed with exit code $rc"
+            exit "$rc"
+          fi
           echo "--- firmware volumes produced ---"
-          find . -name '*.fd' -not -path './Binaries/*' | head -20
+          find . -name '*.fd' -not -path './Binaries/*' | tee "$RUNNER_TEMP/fd-list.txt"
+          # An exit code of 0 with no volume is still a failure, and a quiet one otherwise.
+          test -s "$RUNNER_TEMP/fd-list.txt" || {
+            echo "::error::build_uefi.py succeeded but produced no .fd at all"; exit 1; }
 
       - name: Collect the firmware
         run: |
