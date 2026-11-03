@@ -179,6 +179,9 @@ jobs:
   image:
     name: pack boot.img
     needs: [kernel, loader]
+    # The UEFI firmware volume is board-specific and built by the uefi workflow, which is
+    # a separate dispatch because its tree is ~5 GB. It is passed in rather than switched
+    # on, because a repository_dispatch/workflow_run dependency would couple the two.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -189,16 +192,63 @@ jobs:
         with:
           path: in
 
+      - name: Fetch the polaris UEFI firmware, if the uefi workflow has produced one
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: polaris-SILICIUM_UEFI.fd
+          path: in
+
       - name: Pack
         run: |
           set -e
           ls -l in/mach.development.bcm2837/mach.development.bcm2837 in/loader.efi/loader.efi
           mkdir -p out/polaris
 
-          # the device profile is the single source of these values
+          # The device profile is the single source of these values. They must be EXPORTED:
+          # mkxnuimg.py reads them through os.environ and, when they are unset, silently
+          # falls back to its redwood defaults (TARGET=redwood, FD_BASE=0x9FD00000,
+          # FD_SIZE=0x200000, PAYLOAD_BASE=0xF0000000) and to the poco-x5-pro prebuilt
+          # firmware. Its guard only fires when TARGET is explicitly something other than
+          # redwood, so a missing export produces a plausible-looking image built for the
+          # wrong phone. That happened once; this is the fix.
+          set -a
           . ./devices/polaris/device.conf
-          echo "FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE"
+          set +a
+          echo "TARGET=$UEFI_TARGET FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE"
           echo "BOOTARGS=$BOOTARGS"
+          test -n "$UEFI_TARGET" || { echo 'UEFI_TARGET not set by device.conf'; exit 1; }
+          test -n "$FD_BASE" || { echo 'FD_BASE not set by device.conf'; exit 1; }
+
+          # The UEFI firmware must be polaris'. If one was downloaded from the uefi
+          # workflow it is at in/SILICIUM_UEFI.fd; otherwise UEFI_FD must name a real file.
+          # Either way there is no fallback to another phone's prebuilt: mkxnuimg.py would
+          # happily use the poco-x5-pro one when UEFI_FD is unset, and that produced an
+          # image for the wrong SoC once.
+          if [ -f in/SILICIUM_UEFI.fd ]; then
+            export UEFI_FD="$PWD/in/SILICIUM_UEFI.fd"
+            echo "UEFI_FD from the uefi workflow: $UEFI_FD"
+          fi
+          test -n "$UEFI_FD" -a -f "$UEFI_FD" || {
+            echo 'No polaris UEFI firmware available.'
+            echo 'Run the "polaris UEFI" workflow, or set UEFI_FD to a built'
+            echo 'SILICIUM_UEFI.fd. Refusing to fall back to the redwood prebuilt.'
+            exit 1
+          }
+          FD_ACTUAL=$(stat -c %s "$UEFI_FD")
+          echo "UEFI FD: $UEFI_FD ($FD_ACTUAL bytes, device.conf FD_SIZE=$((FD_SIZE)))"
+          test "$FD_ACTUAL" = "$((FD_SIZE))" || {
+            echo 'FD size disagrees with FD_SIZE in devices/polaris/device.conf.'
+            echo 'mkxnuimg.py asserts these are equal; fix whichever is wrong.'
+            exit 1
+          }
+          # Prove it is polaris firmware and not another board's, before it goes in the
+          # image. The FD is an FFS volume, so the strings of its driver names are in it.
+          if strings -a "$UEFI_FD" | grep -qiE 'yupik|redwood|sm7325'; then
+            echo 'the FD mentions a redwood-class SoC: wrong firmware for polaris'
+            exit 1
+          fi
+          echo 'UEFI FD is not redwood firmware'
 
           # The container: the loader is what the payload carries as "loader.efi", and the
           # kernel as "kernel". The cmdline is the board's, with the platform named
@@ -211,6 +261,7 @@ jobs:
             loader.efi=in/loader.efi/loader.efi \
             kernel=in/mach.development.bcm2837/mach.development.bcm2837
 
+          test -f "$DTB" || { echo "DTB=$DTB does not exist"; exit 1; }
           python3 mkxnuimg.py -p out/polaris/usb-payload.bin -o out/polaris/boot.img
           ls -l out/polaris/
           sha256sum out/polaris/*
@@ -259,6 +310,14 @@ jobs:
           # The DTB follows the gzip member inside the kernel field; report whether the
           # bootloader will find one, without insisting on it (a shim-only image has none).
           rest = body[len(body) - (len(body) - len(gzip.compress(b""))) :] if False else None
+          # The board must be polaris, not a leftover prebuilt for another phone. The
+          # appended device tree is the cheapest proof: it names its own SoC.
+          assert len(tail) > 8, "no device tree appended"
+          assert b"polaris" in tail.lower() or b"Polaris" in tail, \
+              "the appended DTB does not mention polaris -- wrong board firmware"
+          for bad in (b"Yupik", b"yupik", b"redwood", b"SM7325"):
+              assert bad not in tail, "the DTB is %r: this is redwood firmware" % bad
+          print("appended DTB names polaris and is not redwood")
           print("OK")
           PY
 

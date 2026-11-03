@@ -1,0 +1,99 @@
+name: polaris UEFI
+
+# Build Mu-Silicium for the Xiaomi Mi MIX 2S (polaris), which is the firmware volume the phone
+# actually boots before XNU. It is built here rather than on the developer's machine because
+# the tree is ~5 GB and the EDK2 build wants a Linux toolchain.
+#
+# The point of this job is the artifact: SILICIUM_UEFI.fd for polaris, which the boot-image
+# packing job needs. Without it that job has nothing board-correct to put in the FD region,
+# and must not fall back to another phone's prebuilt.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, raphael-bringup, polaris-uefi]
+    paths:
+      - '.github/workflows/uefi.yml'
+      - 'devices/polaris/uefi/**'
+
+jobs:
+  uefi:
+    name: build polaris SILICIUM_UEFI.fd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Disk space
+        run: |
+          # The Mu tree plus its submodules is several GB; the runner image has ~14 GB free
+          # on / and nearly 70 GB on /mnt, so put the checkout on /mnt.
+          df -h / /mnt || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / || true
+
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential uuid-dev iasl nasm python3 python3-venv python3-pip \
+            git ca-certificates curl xz-utils
+          python3 --version
+
+      - name: Clone Mu-Silicium with its submodules
+        run: |
+          set -e
+          # The submodules matter: Binaries is Project-Silicium/Device-Binaries, which is where
+          # the polaris firmware drivers come from. raphael's BASE pins the tree this port was
+          # made against.
+          cd /mnt
+          git clone --recursive --depth 1 \
+            https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          cd Mu-Silicium
+          git log --oneline -1
+          ls Binaries | head
+          test -d Binaries/polaris || { echo "no Binaries/polaris in the submodule"; exit 1; }
+          ls Binaries/polaris
+          du -sh . Binaries
+
+      - name: Build polaris
+        run: |
+          set -e
+          cd /mnt/Mu-Silicium
+          export PATH="$PWD:$PATH"
+          # python3 build_uefi.py -d polaris (Building.md). It needs its pip requirements.
+          python3 -m pip install --quiet --break-system-packages -r pip-requirements.txt || \
+            python3 -m pip install --quiet -r pip-requirements.txt
+          python3 build_uefi.py -d polaris 2>&1 | tail -80
+          echo "--- looking for the firmware volume ---"
+          find . -name 'SILICIUM_UEFI.fd' -o -name '*.fd' | head -20
+
+      - name: Collect the firmware
+        run: |
+          set -e
+          cd /mnt/Mu-Silicium
+          FD=$(find . -path ./Binaries -prune -o -name 'SILICIUM_UEFI.fd' -print | head -1)
+          test -n "$FD" || { echo "build produced no SILICIUM_UEFI.fd"; exit 1; }
+          echo "FD=$FD"
+          ls -l "$FD"
+          sha256sum "$FD"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$FD" "$GITHUB_WORKSPACE/out/SILICIUM_UEFI.fd"
+          # It must be exactly the size the polaris FD region expects, or the shim's copy is
+          # wrong: devices/polaris/device.conf says FD_SIZE, and mkxnuimg.py asserts equality.
+          SIZE=$(stat -c %s "$GITHUB_WORKSPACE/out/SILICIUM_UEFI.fd")
+          echo "SIZE=$SIZE (0x$(printf %x $SIZE))"
+          . "$GITHUB_WORKSPACE/devices/polaris/device.conf"
+          echo "device.conf FD_SIZE=$FD_SIZE"
+          if [ "$SIZE" != "$((FD_SIZE))" ]; then
+            echo "WARNING: built FD is $SIZE bytes but device.conf FD_SIZE is $((FD_SIZE))."
+            echo "The image job asserts these match; one of them must be corrected."
+          fi
+
+      - name: Upload the firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: polaris-SILICIUM_UEFI.fd
+          path: out/SILICIUM_UEFI.fd
+          if-no-files-found: error
+          retention-days: 14
