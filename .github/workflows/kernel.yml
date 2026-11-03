@@ -66,6 +66,14 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends clang lld llvm
           clang --version | head -1
 
+      # Before compiling: the loader runs both under QEMU and on the phone, and code written for
+      # one faults on the other. That is not theoretical -- the first polaris boot died on the
+      # QEMU-only fw_cfg write, and the loader's own exception hook was installed too late to
+      # report it. This reads the source, so it catches the mistake in seconds rather than after
+      # a ten-minute build and a phone reboot.
+      - name: Check that QEMU-only code is behind a QEMU gate
+        run: python3 tools/check-qemu-paths.py
+
       - name: Build
         run: |
           set -e
