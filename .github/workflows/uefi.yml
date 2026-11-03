@@ -40,10 +40,15 @@ jobs:
           # llvm is required, not optional: Mu-Silicium's BootShim Makefile runs
           # `llvm-objcopy -O binary`, and without it the build dies with
           # "make: llvm-objcopy: No such file or directory ... Error 127".
-          # setup_env.sh is supposed to provide the toolchain but does not put this on PATH.
+          #
+          # mono is required by stuart's own package resolution: on a non-Windows host it
+          # runs NuGet through mono, and without it the build fails at
+          # "[SDE] Failed to fetch NugetDependency: mu_nasm@20016.1.1: Mono is required"
+          # before compiling a single file. ca-certificates-mono is named in that message and
+          # is needed for mono's TLS to work.
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential uuid-dev iasl nasm python3 python3-venv python3-pip \
-            git ca-certificates curl xz-utils llvm
+            git ca-certificates curl xz-utils llvm mono-devel ca-certificates-mono
           python3 --version
           # The unversioned name is what the Makefile calls; some images only ship the
           # versioned one, so make the link if it is missing.
@@ -55,8 +60,10 @@ jobs:
           fi
           llvm-objcopy --version
           clang --version | head -1 || true
-          # BootShim also calls clang and llvm-objcopy together; confirm the pair resolves.
-          for t in clang llvm-objcopy make; do command -v $t || { echo "missing tool: $t"; exit 1; }; done
+          # Confirm everything the build shells out to resolves before spending 20 minutes.
+          for t in clang llvm-objcopy make nasm iasl mono; do
+            command -v $t || { echo "missing tool: $t"; exit 1; }
+          done
 
       - name: Clone Mu-Silicium and its submodules
         run: |
@@ -183,10 +190,39 @@ jobs:
           fi
           echo "FD size matches device.conf and it is polaris firmware"
 
+          # The device tree the image will be packed with. Take Mu-Silicium's polaris.dtb as
+          # delivered and confirm it describes this SoC, so the image job gets a DTB that is
+          # named and checked rather than one that mkxnuimg.py happens to find.
+          DTB="$RUNNER_TEMP/Mu-Silicium/Resources/DTBs/polaris.dtb"
+          test -f "$DTB" || { echo "::error::no Resources/DTBs/polaris.dtb in Mu-Silicium"; exit 1; }
+          cp "$DTB" "$GITHUB_WORKSPACE/out/polaris.dtb"
+          ls -l "$GITHUB_WORKSPACE/out/polaris.dtb"
+          printf 'DTB magic: '; head -c 4 "$GITHUB_WORKSPACE/out/polaris.dtb" | od -An -tx1
+          # A DTB starts d00dfeed. Anything else is not a device tree and must not be appended.
+          head -c 4 "$GITHUB_WORKSPACE/out/polaris.dtb" | od -An -tx1 | grep -q 'd0 0d fe ed' \
+            || { echo "::error::the polaris DTB does not start with d00dfeed"; exit 1; }
+          if strings -a "$GITHUB_WORKSPACE/out/polaris.dtb" | grep -qiE 'yupik|sm7325'; then
+            echo "::error::the DTB describes a redwood-class SoC, not polaris"; exit 1
+          fi
+          strings -a "$GITHUB_WORKSPACE/out/polaris.dtb" | grep -i 'polaris' | head -3 \
+            || { echo "::error::the DTB never names polaris"; exit 1; }
+          echo "polaris DTB is a device tree and names polaris"
+
       - name: Upload the firmware
         uses: actions/upload-artifact@v4
         with:
           name: polaris-SILICIUM_UEFI.fd
-          path: out/SILICIUM_UEFI.fd
+          # The device tree travels with the firmware. The image job needs one at $DTB, nothing
+          # in this repository produces it, and mkxnuimg.py silently falls back to
+          # Mu-Silicium/Resources/DTBs/<target>.dtb -- which for polaris exists upstream
+          # (492460 bytes) but is a community snapshot, not this phone's own. Shipping it as an
+          # artifact makes the difference between "the DTB that was built against" and "whatever
+          # happened to be in the tree" visible, and lets the image job name it explicitly.
+          # It is still not the authority: the phone's own DTB is appended by the bootloader and
+          # is what the hardware actually uses; this one only has to describe the board well
+          # enough for XNU's platform detection.
+          path: |
+            out/SILICIUM_UEFI.fd
+            out/polaris.dtb
           if-no-files-found: error
           retention-days: 14

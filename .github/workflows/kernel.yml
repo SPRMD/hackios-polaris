@@ -261,7 +261,23 @@ jobs:
             loader.efi=in/loader.efi/loader.efi \
             kernel=in/mach.development.bcm2837/mach.development.bcm2837
 
+          # The device tree. device.conf names out/polaris/polaris.dtb, and nothing in this
+          # repository produces it, so prefer the one the uefi workflow built against and
+          # shipped beside the firmware. Without this fallback mkxnuimg.py would reach into
+          # Mu-Silicium/Resources/DTBs and use whatever it found there, which is the kind of
+          # silent substitution that produced a redwood image once already.
+          if [ -f in/polaris.dtb ]; then
+            export DTB="$PWD/in/polaris.dtb"
+            echo "DTB from the uefi workflow: $DTB"
+          fi
           test -f "$DTB" || { echo "DTB=$DTB does not exist"; exit 1; }
+          echo "DTB: $DTB ($(stat -c %s "$DTB") bytes)"
+          head -c 4 "$DTB" | od -An -tx1 | grep -q 'd0 0d fe ed' \
+            || { echo "the DTB does not start with d00dfeed"; exit 1; }
+          if strings -a "$DTB" | grep -qiE 'yupik|sm7325'; then
+            echo "the DTB describes a redwood-class SoC, not polaris"
+            exit 1
+          fi
           python3 mkxnuimg.py -p out/polaris/usb-payload.bin -o out/polaris/boot.img
           ls -l out/polaris/
           sha256sum out/polaris/*
