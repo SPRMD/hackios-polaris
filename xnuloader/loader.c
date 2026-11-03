@@ -2548,11 +2548,8 @@ parse_number(const char *c, unsigned base)
 	return v;
 }
 
-static int
 /*
- * bootarg(PREFIX): the text after `prefix` in the payload's cmdline entry, or NULL.
- *
- * The platform has to be chosen before parse_payload() runs (the selection decides how the
+ * bootarg(PREFIX): the text after `prefix` in the payload's cmdline entry, or NULL. The platform has to be chosen before parse_payload() runs (the selection decides how the
  * payload is started), so this walks the payload itself rather than taking a struct
  * payload_info. It only looks for the one entry it needs and does not validate anything else.
  * A prefix must be followed by a space or the end of the line, so "platform=polarisx" does not
@@ -2595,6 +2592,7 @@ bootarg(const char *prefix)
 	return NULL;
 }
 
+static int
 parse_payload(struct payload_info *pi, int verbose)
 {
 	struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
