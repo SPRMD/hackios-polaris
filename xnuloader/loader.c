@@ -560,7 +560,8 @@ static const struct platform platform_raphael = {
 
 /*
  * Xiaomi Mi MIX 2S (polaris, SDM845). From the phone's own device tree in the official MIUI
- * 12.5 package: model "Xiaomi Technologies, Inc. Polaris P2 v2.1", qcom,board-id <0x2a 0x0>,
+ * 12.5 package and from the polaris DTB this port ships (both agree):
+ * model "Xiaomi Technologies, Inc. Polaris MP v2.1", qcom,board-id <0x2c 0x0>,
  * qcom,msm-id <0x141 0x20001>.
  *
  * The GIC addresses are the same as raphael's (0x17A00000 / 0x17A60000) and the timer's PPI is
