@@ -7,12 +7,11 @@ name: polaris UEFI
 # It is built here rather than on the developer's machine because the tree is ~5 GB and the
 # EDK2 build wants a Linux toolchain.
 on:
+  # Dispatch only. This build takes up to four hours and pulls a several-GB tree, so it is run
+  # when a firmware volume is actually wanted rather than on every edit under
+  # devices/polaris/uefi. The cheap gate for those edits is the polaris-uefi workflow, which
+  # checks the port against itself and proves the patch applies in about five minutes.
   workflow_dispatch:
-  push:
-    branches: [main, raphael-bringup, polaris-uefi]
-    paths:
-      - '.github/workflows/uefi.yml'
-      - 'devices/polaris/uefi/**'
 
 env:
   MU_REPO: https://github.com/Project-Silicium/Mu-Silicium.git
@@ -77,7 +76,15 @@ jobs:
           # switches the display driver).
           MU="$RUNNER_TEMP/Mu-Silicium"
           cd "$MU"
-          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/devices/polaris/uefi/mu-silicium.patch"
+          # --ignore-whitespace is required, not cosmetic. Mu-Silicium stores BootManager.c,
+          # BootManagerLib.inf and Sec.c with CRLF (it is a Windows-developed EDK2 project),
+          # while this patch's context lines are LF, so plain `git apply` fails with "patch does
+          # not apply" on exactly those three files and applies BootShim.S, whose file happens
+          # to be LF. Measured, not guessed: reproduced on an LF checkout at BASE, where
+          # --ignore-whitespace turns the same failure into a clean apply. Not a line-ending
+          # problem in this repository -- the patch is LF as stored.
+          git apply --whitespace=nowarn --ignore-whitespace \
+            "$GITHUB_WORKSPACE/devices/polaris/uefi/mu-silicium.patch"
           cp -r "$GITHUB_WORKSPACE/devices/polaris/uefi/files/." "$MU/"
           # Prove the reservation is in the tree rather than trusting the copy.
           grep -n 'XNU Payload' \

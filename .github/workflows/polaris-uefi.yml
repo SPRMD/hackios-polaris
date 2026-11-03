@@ -76,7 +76,11 @@ jobs:
       - name: Apply mu-silicium.patch
         run: |
           set -euo pipefail
-          git -C /tmp/mu apply --whitespace=nowarn \
+          # --ignore-whitespace: Mu-Silicium stores BootManager.c, BootManagerLib.inf and Sec.c
+          # with CRLF (Windows-developed EDK2 project) while this patch's context is LF, so a
+          # plain apply fails on exactly those three files. Reproduced on a fresh checkout at
+          # BASE; see the same flag and note in workflows/uefi.yml.
+          git -C /tmp/mu apply --whitespace=nowarn --ignore-whitespace \
             "$PWD/devices/polaris/uefi/mu-silicium.patch"
           echo "applied cleanly"
           # The patch is what wires the loader in. Check the wiring is actually there rather
