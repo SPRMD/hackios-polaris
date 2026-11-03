@@ -1,0 +1,21 @@
+# One RAM session on polaris: bring the CPU up, prove the clock, then stop.
+#
+# Deliberately short. raphael's list runs a GPU render and a touch session because that board
+# has been brought that far; polaris has not, so this asks only the questions whose answers
+# are already known to work on this kernel, and adds nothing that would need a driver that
+# does not exist yet. Each line's output is evidence for exactly one claim:
+#
+#   cpu_test        - the four A55s come up and run in parallel
+#   rwtouch wait    - the input device opens and waits (it will time out with touchscreen=0,
+#                     which is the correct result until raphael_touch.c has a polaris path)
+#   ps -A           - what actually got launched, so a missing binary is visible rather than
+#                     inferred from silence
+#
+# Not here on purpose: gl_test (no A630 path in hakios.adreno.c yet), net_test (no WCN3990
+# bring-up), camera, haptics. Adding them now would only produce timeouts that look like
+# failures of the kernel instead of failures of work not yet done.
+/redwood/bin/hello_dyn polaris combined hardware test
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 45 &
+/redwood/bin/rwtouch wait 20
+/bin/ps -A

@@ -170,3 +170,85 @@ jobs:
             xnu-src/xnu-8796.121.2/BUILD/obj/*/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Pack what the two build jobs produced into the one file a phone can be flashed with.
+  # This is the step that turns "it compiles" into "there is something to try", so it runs
+  # only when both halves are real. mkpayload.py wraps the loader plus the kernel into the
+  # XNUP container the loader looks for, and mkxnuimg.py puts that container into an Android
+  # boot image.
+  image:
+    name: pack boot.img
+    needs: [kernel, loader]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the kernel and the loader
+        uses: actions/download-artifact@v4
+        with:
+          path: in
+
+      - name: Pack
+        run: |
+          set -e
+          ls -l in/mach.development.bcm2837/mach.development.bcm2837 in/loader.efi/loader.efi
+          mkdir -p out/polaris
+
+          # the device profile is the single source of these values
+          . ./devices/polaris/device.conf
+          echo "FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE"
+          echo "BOOTARGS=$BOOTARGS"
+
+          # The container: the loader is what the payload carries as "loader.efi", and the
+          # kernel as "kernel". The cmdline is the board's, with the platform named
+          # explicitly -- the loader's own auto-detection cannot tell polaris from raphael,
+          # so it must be told (see the platform= handling in xnuloader/loader.c).
+          python3 xnuloader/mkpayload.py \
+            -o out/polaris/usb-payload.bin \
+            --usb \
+            --cmdline "platform=polaris $BOOTARGS" \
+            loader.efi=in/loader.efi/loader.efi \
+            kernel=in/mach.development.bcm2837/mach.development.bcm2837
+
+          python3 mkxnuimg.py -p out/polaris/usb-payload.bin -o out/polaris/boot.img
+          ls -l out/polaris/
+          sha256sum out/polaris/*
+
+      - name: Check the image is what it claims to be
+        run: |
+          set -e
+          python3 - <<'PY'
+          import struct, sys
+          p = "out/polaris/boot.img"
+          d = open(p, "rb").read()
+          # Android boot image: "ANDROID!" magic, page size at byte 36 (little endian)
+          assert d[:8] == b"ANDROID!", "no ANDROID! magic: %r" % d[:8]
+          page = struct.unpack_from("<I", d, 36)[0]
+          kernel_size = struct.unpack_from("<I", d, 8)[0]
+          ramdisk_size = struct.unpack_from("<I", d, 16)[0]
+          print("ANDROID! page_size=%d kernel=%d ramdisk=%d total=%d"
+                % (page, kernel_size, ramdisk_size, len(d)))
+          assert page in (2048, 4096, 8192, 16384), "implausible page size %d" % page
+          assert kernel_size > 0, "empty kernel"
+          assert len(d) > page, "image shorter than its own header page"
+          # The XNUP container must be inside, or the loader will find no payload.
+          assert b"XNUP" in d, "no XNUP payload in the image"
+          i = d.index(b"XNUP")
+          size = struct.unpack_from("<I", d, i + 4)[0]
+          print("XNUP at 0x%x, container size 0x%x (%d)" % (i, size, size))
+          for name in (b"loader.efi", b"kernel", b"cmdline"):
+              assert name in d, "payload has no %r entry" % name
+          print("payload entries: loader.efi kernel cmdline -- all present")
+          assert b"platform=polaris" in d, "cmdline does not name the platform"
+          print("OK")
+          PY
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: polaris-boot.img
+          path: out/polaris/boot.img
+          if-no-files-found: error
+          retention-days: 14
+
