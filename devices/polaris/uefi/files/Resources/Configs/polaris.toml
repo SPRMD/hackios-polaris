@@ -1,0 +1,34 @@
+#
+# Boot Shim Configs
+#
+[boot_shim]
+requires_kernel_header = true
+
+#
+# UEFI FD Configs
+#
+# base: where BootShim.S copies the FD, from polaris' own memory map
+#       (uefiplat.cfg inside xbl.img: "UEFI FD", 0x9FC00000, 0x00300000).
+# size: the IMAGE we build, i.e. the FFS volume's FvLength and the size of the
+#       ELF PT_LOAD segment at paddr 0x9FC00000, both measured: 0x220000.
+#       This is NOT the 0x00300000 reserved region in MemoryMapLib.c, which runs
+#       from 0x9FC00000 up to SEC Heap at 0x9FF00000. The image has to fit inside
+#       the reservation, not fill it. Do not "fix" one to match the other.
+#       FD_BLOCKS is size/4096 = 0x220, and the FV's own NumBlocks is 4352.
+#
+[uefi_fd]
+base = 0x9FC00000
+size = 0x220000
+
+#
+# Android Boot Image Kernel Configs
+#
+[boot_image_kernel]
+kernel_compression = "gzip"
+append_dtb         = true
+
+#
+# Android Boot Image Configs
+#
+[boot_image]
+header_version = 1
