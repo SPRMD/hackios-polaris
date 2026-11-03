@@ -1185,8 +1185,18 @@ static const struct {
 	const char *name;
 	uint64_t bytes;
 } ufs_references[] = {
-	{ "bluetooth", 503808 }, { "abl", 208896 }, { "aop", 208896 }, { "xbl", 3706880 },
-	{ "tz", 3710976 }, { "hyp", 3653632 }, { "dsp", 67108864 }, { "modem", 214265856 },
+	/*
+	 * The length of each partition's image on polaris, taken from the .img files of the
+	 * official MIUI 12.5.1.0.QDGCNXM package in this workspace -- the same package the
+	 * board constants came from. These were another board's numbers before: every one of
+	 * the eight was wrong for polaris (modem by 40 MB, hyp by 3.2 MB, tz by 1.6 MB), so a
+	 * hash taken over them covered the wrong range of the partition and meant nothing.
+	 *
+	 * Not the GPT partition size: that is larger than the image and says nothing about
+	 * what is in it.
+	 */
+	{ "bluetooth", 765952 }, { "abl", 155648 }, { "aop", 184748 }, { "xbl", 3965832 },
+	{ "tz", 2064384 }, { "hyp", 396624 }, { "dsp", 33554432 }, { "modem", 172470272 },
 };
 
 static uint8_t ufs_buffer[1024 * 1024] __attribute__((aligned(4096)));

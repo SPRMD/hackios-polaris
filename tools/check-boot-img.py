@@ -26,6 +26,9 @@ EXPECT = {
     'fd_size': 0x220000,
     'payload_base': 0xA0000000,
     'fb_base': 0x9D400000,
+    # The page size of polaris' own boot.img (official MIUI package), line with TWRP's
+    # BOARD_KERNEL_PAGESIZE and LineageOS' sdm845-common.
+    'page_size': 4096,
 }
 # SoC names that must not appear anywhere in the device tree.
 FOREIGN_SOCS = (b'Yupik', b'yupik', b'redwood', b'SM7325', b'sm7325', b'cape', b'Cape')
@@ -49,6 +52,14 @@ def main(argv):
     if page not in PAGE_SIZES:
         print('  implausible page size')
         ok = False
+    elif page != EXPECT['page_size']:
+        # polaris' own boot.img says 4096, and so do TWRP's and LineageOS' board configs.
+        # Any other value means the image was built with mkbootimg's legacy default again.
+        print('  page size %d, but polaris\' own boot image and both reference device trees '
+              'say %d' % (page, EXPECT['page_size']))
+        ok = False
+    else:
+        print('  page size matches the phone\'s own boot image (%d)' % page)
 
     body = d[page:page + ksize]
     if body[:2] != b'\x1f\x8b':

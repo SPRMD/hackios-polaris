@@ -1,0 +1,15 @@
+# polaris' own partition sizes, from the official MIUI fastboot package
+
+# V12.5.1.0.QDGCNXM (the package in this workspace). Each number is the size of the
+# .img file the package flashes into that partition -- not the GPT partition size, which
+# is larger and gives no information about what the image is. This is what a hash over
+# "the partition's image" must use.
+
+bluetooth 765952
+abl       155648
+aop       184748
+xbl       3965832
+tz        2064384
+hyp       396624
+dsp       33554432
+modem     172470272

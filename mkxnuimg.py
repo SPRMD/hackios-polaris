@@ -178,8 +178,16 @@ open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
     # board "HACKiOS": how the loader of an installed phone tells which A/B slot's boot partition is its own
     # (xnuloader/flashboot.c, ab_switch_back) -- an Android boot image never has that name
+    #
+    # The page size is 4096, not mkbootimg's 2048 default. polaris' own boot.img says 4096
+    # (official MIUI 12.5.1.0.QDGCNXM, kernel_addr 0x8000, tags 0x100), TWRP's polaris
+    # BoardConfig says BOARD_KERNEL_PAGESIZE := 4096, and LineageOS' sdm845-common -- which
+    # every Xiaomi SDM845 board inherits -- says 4096 too. Three sources, none of them this
+    # repository. 2048 is mkbootimg's legacy default from a much older Android and it made
+    # this the only image for this phone that ever claimed it.
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '--board', 'HACKiOS', '-o', args.output])
+                           '--header_version', '1', '--pagesize', '4096', '--board', 'HACKiOS',
+                           '-o', args.output])
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')
