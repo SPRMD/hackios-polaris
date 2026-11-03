@@ -2,6 +2,9 @@
  * BootShim for HACKiOS: place the UEFI firmware volume and the XNUP payload where the
  * firmware will look for them, then jump to the firmware.
  *
+ *   FD       _Head + SHIM_SIZE            -> FD_BASE            (FD_SIZE bytes)
+ *   payload  _Head + SHIM_SIZE + FD_SIZE  -> XNU_PAYLOAD_BASE   (PAYLOAD_SIZE bytes)
+ *
  * The upstream shim copies FD_SIZE bytes to FD_BASE and jumps. That is enough only if the
  * firmware reads its payload from where the boot image left it. This firmware does not: it
  * reads XNU_PAYLOAD_BASE (Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.h),
@@ -14,22 +17,32 @@
  * 0xFFFB77FF is not "XNUP" and 4294966269 is -1027 read unsigned: untouched memory. So this
  * shim copies the payload to XNU_PAYLOAD_BASE as well.
  *
- *   FD       _Payload          -> FD_BASE            (FD_SIZE bytes)
- *   payload  _Payload + FD_SIZE -> XNU_PAYLOAD_BASE  (PAYLOAD_SIZE bytes)
- *
- * Both destinations are read from literals, so this works wherever the image was loaded.
+ * Both destinations are read from immediates, so this works wherever the image was loaded.
  * The payload copy walks forward, which is the safe direction when destination < source;
  * when the two are equal it is skipped, and when the bootloader happened to unpack the
  * image above XNU_PAYLOAD_BASE the copy is still downward because
- * _Payload + FD_SIZE > XNU_PAYLOAD_BASE for any plausible load address.
+ * _Head + SHIM_SIZE + FD_SIZE > XNU_PAYLOAD_BASE for any plausible load address.
  *
- * Parameters are -D defines from the Makefile: FD_BASE, FD_SIZE, XNU_PAYLOAD_BASE,
- * PAYLOAD_SIZE.
+ * Where the FD starts is fixed by the packer: mkxnuimg.py pads this shim to SHIM_SIZE bytes
+ * and writes the FD immediately after it. Do NOT go back to `adr x1, _Payload` with a label
+ * at the end of this file: a label is not the end of the binary, because the assembler puts
+ * the literal pool for the `ldr =...` below after the last instruction. That is exactly what
+ * happened once. _Payload came out as 192 while the FD began at 200, so the firmware volume
+ * was copied to FD_BASE eight bytes out of place, its header was garbage, the firmware never
+ * started, and the phone showed a black screen. mkxnuimg.py now decodes these two
+ * instructions and refuses to build an image whose SHIM_SIZE disagrees with them.
+ *
+ * Parameters are -D defines from the Makefile: SHIM_SIZE, FD_BASE, FD_SIZE,
+ * XNU_PAYLOAD_BASE, PAYLOAD_SIZE.
  */
 
+#ifndef SHIM_SIZE
+#define SHIM_SIZE 0x400
+#endif
+
 _Head:
-  adr   x1, _Payload    /* x1 = end of this shim = where the FD begins */
-  b     _Start
+  adr   x1, _Head          /* code0 in the arm64 Image header: this shim's load address */
+  b     _Start             /* code1: the header below must stay at offset 8, magic at 0x38 */
 
 #if REQUIRES_KERNEL_HEADER == 1
 _StackBase:
@@ -46,7 +59,7 @@ _StackSize:
 #endif
 
 _Start:
-  mov   x4, x1          /* x4 = _Payload: the FD starts here */
+  mov   x4, x1          /* x4 = the FD's source address */
   ldr   x10, =FD_SIZE
   add   x10, x4, x10    /* x10 = where the payload is now: just past the FD */
 
@@ -96,6 +109,4 @@ _Dead:
   b     _Dead
 
 .text
-.align 4
-
-_Payload:
+.balign 8 /* the literal pool for the ldr =... above lands here; packing pads past it */

@@ -1,29 +1,35 @@
-"""Verify the boot shim actually moves the payload, by decoding its instructions.
+"""Verify the boot shim actually places the firmware volume and the payload, by decoding it.
 
-A byte search for 0xA0000000 in the shim finds nothing even when the address is right,
-because the compiler loads it as `movz x9, #0xa000, lsl #16` -- the constant is split
-across the instruction's immediate fields. Searching for the address as a data literal is
-therefore the wrong test, and it reported a false failure twice while the shim was correct.
+Two classes of mistake this catches, both of which cost a phone boot:
 
-So decode the two instruction forms that can materialise a 64-bit constant here:
+1. A byte search for 0xA0000000 in the shim finds nothing even when the address is right,
+   because the compiler materialises it as `movz x9, #0xa000, lsl #16` -- the constant is split
+   across the instruction's immediate fields. Searching for the address as a data literal is
+   therefore the wrong test. So decode the forms that can materialise a 64-bit constant:
 
-    MOVZ  Rd, #imm16, lsl #shift      opcode 0b110100101 << 23
-    LDR   Xt, <literal>               loads a 64-bit value from a nearby literal pool
+       MOVZ  Rd, #imm16, lsl #shift      opcode 0b110100101 << 23
+       LDR   Xt, <literal>               loads a 64-bit value from a nearby literal pool
 
-and check for the three addresses the shim must place, plus the copy sizes.
+2. The FD's position in the image is the shim's own size, and the shim computes it from its
+   load address with `adr x1, _Head; add x1, x1, #SHIM_SIZE`. If those two disagree -- which is
+   what happens when the shim uses a label at the end of its source file, because the literal
+   pool is emitted after that label -- the firmware volume is copied to FD_BASE shifted by the
+   size of the pool. Its header is then garbage, the firmware never starts, and the phone shows
+   a black screen with the backlight on. That happened once: the shim said 192, the FD was at
+   200, and the pool was the missing 8 bytes. So decode the pair and compare it with where the
+   firmware volume actually is in the image.
 
-usage: check_shim.py boot.img --expect-payload-base 0xA0000000
+usage: check-shim.py boot.img --expect-payload-base 0xA0000000 --fd-base 0x9FC00000 \
+           --fd-size 0x220000 [--payload-size N]
 """
 import struct
 import sys
 import zlib
 
 
-def decode(blob, fv_off):
-    """Yield (offset, kind, value) for MOVZ and LDR-literal instructions in the shim."""
-    shim = blob[:fv_off]
-    # AArch64 instructions are 4-byte aligned. The head of the shim is the PE/stack header,
-    # not code, so start where the first `b` or `adr` was seen (offset 0 of _Head is code).
+def decode_constants(blob, shim_len):
+    """Return (offset, kind, value) for MOVZ and LDR-literal instructions in the shim."""
+    shim = blob[:shim_len]
     seen = []
     i = 0
     while i + 4 <= len(shim):
@@ -33,10 +39,8 @@ def decode(blob, fv_off):
             sf = (w >> 31) & 1
             hw = (w >> 21) & 3
             imm16 = (w >> 5) & 0xFFFF
-            rd = w & 0x1F
             if sf:
-                value = imm16 << (hw * 16)
-                seen.append((i, 'movz', value, rd, hw, imm16))
+                seen.append((i, 'movz', imm16 << (hw * 16)))
         # LDR Xt, literal: opc=01, 011000, imm19
         elif (w & 0xFF000000) == 0x58000000:
             imm19 = (w >> 5) & 0x7FFFF
@@ -44,10 +48,43 @@ def decode(blob, fv_off):
                 imm19 -= 1 << 19
             target = i + imm19 * 4
             if 0 <= target <= len(shim) - 8:
-                value = struct.unpack_from('<Q', shim, target)[0]
-                seen.append((i, 'ldr', value, w & 0x1F, target, None))
+                seen.append((i, 'ldr', struct.unpack_from('<Q', shim, target)[0]))
         i += 4
     return seen
+
+
+def decode_slot(blob):
+    """Decode the shim's entry and return the FD offset it computes, or (None, why).
+
+    The entry is `adr x1, _Head; b _Start` at offset 0 -- code0/code1 of the arm64 Image header,
+    which keeps the header's magic at its fixed offset 0x38 -- and the body at the branch target
+    starts with `add x1, x1, #SHIM_SIZE`.
+    """
+    if len(blob) < 0x48:
+        return None, 'the image is too short to hold the shim\'s entry and its arm64 header'
+    adr, br = struct.unpack_from('<II', blob, 0)
+    if (adr & 0x9F000000) != 0x10000000 or (adr & 0x1F) != 1:
+        return None, 'the shim does not begin with `adr x1, _Head` (got %08x)' % adr
+    imm = (((adr >> 5) & 0x7FFFF) << 2) | ((adr >> 29) & 3)
+    if imm & 0x100000:
+        imm -= 0x200000
+    if imm != 0:
+        return None, ('the shim\'s `adr x1, _Head` is not 0, so its entry point is not the first '
+                      'instruction and it cannot know its own load address')
+    if (br & 0xFC000000) != 0x14000000:
+        return None, 'the shim\'s second instruction is not a branch (got %08x)' % br
+    target = (br & 0x3FFFFFF) * 4
+    if target & 0x8000000:
+        target -= 0x10000000
+    if target + 8 > len(blob):
+        return None, 'the shim branches to %#x, past its end' % target
+    add = struct.unpack_from('<I', blob, target)[0]
+    if (add & 0xFF800000) != 0x91000000 or (add & 0x1F) != 1 or ((add >> 5) & 0x1F) != 1:
+        return None, ('the shim\'s body at %#x does not start with `add x1, x1, #SHIM_SIZE` '
+                      '(got %08x); a shim packed by this repository does' % (target, add))
+    if (add >> 22) & 3:
+        return None, 'the shim adds its slot shifted, which the packer does not expect'
+    return (add >> 10) & 0xFFF, None
 
 
 def main(argv):
@@ -70,14 +107,34 @@ def main(argv):
     if fvh < 0:
         print('  no _FVH in the image')
         return 1
+    # The firmware volume proper starts 0x28 bytes into the FD: the first bytes are the stub
+    # that the firmware's own build puts in front of the FV header.
     fv_off = fvh - 0x28
     fv_len = struct.unpack_from('<Q', blob, fv_off + 0x20)[0]
-    print('  shim: %d bytes, firmware volume at 0x%x, FvLength 0x%x'
-          % (fv_off, fv_off, fv_len))
+    print('  firmware volume at 0x%x, FvLength 0x%x, so the shim is %d bytes'
+          % (fv_off, fv_len, fv_off))
 
-    ins = decode(blob, fv_off)
-    movz = [(o, v) for o, k, v, *_ in ins if k == 'movz']
-    ldr = [(o, v) for o, k, v, *_ in ins if k == 'ldr']
+    ok = True
+
+    # The shim has to find the FD where it really is. This is the check that the 8-byte
+    # literal-pool shift would have failed.
+    slot, why = decode_slot(blob)
+    if why:
+        print("  the shim's FD offset: %s" % why)
+        ok = False
+    elif slot != fv_off:
+        print('  the shim computes its FD offset as 0x%x, but the firmware volume is at 0x%x'
+              % (slot, fv_off))
+        print('  -> the shim would copy the volume to FD_BASE from %d bytes out of place:'
+              % (fv_off - slot))
+        print('     its header would be garbage and the firmware would never start')
+        ok = False
+    else:
+        print('  the shim computes its FD offset as 0x%x, which is where the volume is' % slot)
+
+    ins = decode_constants(blob, fv_off)
+    movz = [(o, v) for o, k, v in ins if k == 'movz']
+    ldr = [(o, v) for o, k, v in ins if k == 'ldr']
     print('  decoded %d constant loads: %d movz, %d ldr-literal'
           % (len(movz) + len(ldr), len(movz), len(ldr)))
 
@@ -93,10 +150,9 @@ def main(argv):
         payload_size = size_args['payload-size']
         checks.append(('PAYLOAD_SIZE', payload_size))
 
-    ok = True
     for name, value in checks:
-        # A 64-bit constant may arrive as one MOVZ (if it fits) or several instructions,
-        # and as an LDR from the literal pool. Accept either representation.
+        # A 64-bit constant may arrive as one MOVZ (if it fits) or several instructions, and
+        # as an LDR from the literal pool. Accept either representation.
         hit = None
         for off, v in movz:
             if v == value:
@@ -118,11 +174,11 @@ def main(argv):
             ok = False
 
     # The payload must sit immediately after the FD, which is what the shim assumes when it
-    # computes _Payload + FD_SIZE.
+    # adds FD_SIZE to the FD's address.
     pay = blob[fv_off + fv_len:]
     print('  payload after the FD: %d bytes, starts %r' % (len(pay), pay[:4]))
     if pay[:4] != b'XNUP':
-        print('  the payload is not at FD_BASE+FD_SIZE where the shim looks for it')
+        print('  the payload is not at FD + FD_SIZE where the shim looks for it')
         ok = False
     elif payload_size is not None and len(pay) != payload_size:
         print('  PAYLOAD_SIZE is %d but the payload is %d bytes' % (payload_size, len(pay)))
@@ -138,7 +194,7 @@ def main(argv):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('usage: check_shim.py boot.img --expect-payload-base 0xA0000000 '
+        print('usage: check-shim.py boot.img --expect-payload-base 0xA0000000 '
               '--fd-base 0x9FC00000 --fd-size 0x220000', file=sys.stderr)
         sys.exit(2)
     sys.exit(main(sys.argv))

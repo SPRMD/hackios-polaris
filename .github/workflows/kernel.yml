@@ -368,6 +368,23 @@ jobs:
           print("OK")
           PY
 
+      # The two checks below are what stand between a passing build and a black screen. The
+      # shim finds the firmware volume from its own load address plus a slot size the packer
+      # chooses; when those two disagree the volume is copied to FD_BASE shifted and the
+      # firmware never starts. mkxnuimg.py refuses to build such an image, and check-shim.py
+      # independently decodes the finished one.
+      - name: Decode the shim and check the volume and payload placement
+        run: |
+          set -e
+          set -a
+          . ./devices/polaris/device.conf
+          set +a
+          python3 tools/check-boot-img.py out/polaris/boot.img
+          python3 tools/check-shim.py out/polaris/boot.img \
+            --expect-payload-base "$PAYLOAD_BASE" \
+            --fd-base "$FD_BASE" --fd-size "$FD_SIZE" \
+            --payload-size "$(stat -c %s out/polaris/usb-payload.bin)"
+
       - name: Upload boot.img
         uses: actions/upload-artifact@v4
         with:

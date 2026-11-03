@@ -125,26 +125,28 @@ def main(argv):
         ok = False
     else:
         print('  FD size matches device.conf FD_SIZE=0x%x' % EXPECT['fd_size'])
-    if fv_off != 0x100 + 0x0 and fv_off < 0x100:
-        print('  the volume begins before the shim could fit: %d byte shim' % fv_off)
-    shim_len = fv_off
-    print('  boot shim ahead of it: %d bytes' % shim_len)
-    if not (100 <= shim_len <= 0x1000):
-        print('  the shim length is not plausible')
+    # The packer pads the shim to a slot and writes the FD right after it, so fv_off is that
+    # slot, not the shim's code length. tools/check-shim.py decodes the slot the shim computes
+    # for itself and compares it with this offset; the range check here only catches nonsense.
+    if fv_off < 0x40:
+        print('  the volume begins before the shim could fit: %d bytes' % fv_off)
+        ok = False
+    print('  boot shim slot ahead of it: %d bytes' % fv_off)
+    if not (0x40 <= fv_off <= 0x1000):
+        print('  the shim slot is not plausible')
         ok = False
 
-    # The shim is assembled with this board's FD_BASE and FD_SIZE, so both are readable in
-    # it as little-endian quads. PAYLOAD_BASE is NOT among them: it is a C macro that
-    # xnuloader/mkpayload.py compiles into the payload, not into BootShim.S, so looking for
-    # it in the shim would always fail. Check it where it lives, below.
+    # The shim materialises this board's FD_BASE and FD_SIZE as immediates (movz/movk, or a
+    # literal-pool load), so a byte search for them is unreliable: before the shim switched to
+    # `adr` + slot it kept one constant in its literal pool, and only that one was findable.
+    # tools/check-shim.py decodes the instructions instead; here only a plain containment test
+    # is made, and a miss is not fatal.
     shim = blob[:fv_off]
     for name in ('fd_base', 'fd_size'):
         want = struct.pack('<Q', EXPECT[name])
         found = want in shim
-        print('  shim encodes %-12s 0x%-9x %s'
-              % (name, EXPECT[name], 'yes' if found else 'NO'))
-        if not found:
-            ok = False
+        print('  shim contains %-12s 0x%-9x as a literal %s'
+              % (name, EXPECT[name], 'yes' if found else 'no (immediate instead)'))
     # And no other board's FD base: 0x9FD00000 is poco-x5-pro's.
     for wrong in (0x9FD00000, 0x9C000000):
         if struct.pack('<Q', wrong) in shim:
