@@ -44,9 +44,14 @@ jobs:
         run: |
           set -e
           # The submodules matter: Binaries is Project-Silicium/Device-Binaries, which is where
-          # the polaris firmware drivers come from. raphael's BASE pins the tree this port was
-          # made against.
-          cd /mnt
+          # the polaris firmware drivers come from.
+          #
+          # Not /mnt: on this runner image it exists but is not writable by the runner user
+          # ('could not create work tree dir: Permission denied'), which costs a whole run to
+          # find out. $RUNNER_TEMP is on the same large volume and is ours. The tree is a few
+          # GB, so report the space before committing to it.
+          df -h "$RUNNER_TEMP" / || true
+          cd "$RUNNER_TEMP"
           git clone --recursive --depth 1 \
             https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
           cd Mu-Silicium
@@ -59,8 +64,10 @@ jobs:
       - name: Build polaris
         run: |
           set -e
-          cd /mnt/Mu-Silicium
+          cd "$RUNNER_TEMP/Mu-Silicium"
           export PATH="$PWD:$PATH"
+          # where the repo checkout is, for the device profile
+          echo "REPO=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           # python3 build_uefi.py -d polaris (Building.md). It needs its pip requirements.
           python3 -m pip install --quiet --break-system-packages -r pip-requirements.txt || \
             python3 -m pip install --quiet -r pip-requirements.txt
@@ -71,7 +78,7 @@ jobs:
       - name: Collect the firmware
         run: |
           set -e
-          cd /mnt/Mu-Silicium
+          cd "$RUNNER_TEMP/Mu-Silicium"
           FD=$(find . -path ./Binaries -prune -o -name 'SILICIUM_UEFI.fd' -print | head -1)
           test -n "$FD" || { echo "build produced no SILICIUM_UEFI.fd"; exit 1; }
           echo "FD=$FD"
