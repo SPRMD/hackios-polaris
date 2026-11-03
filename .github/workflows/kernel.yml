@@ -199,6 +199,26 @@ jobs:
           name: polaris-SILICIUM_UEFI.fd
           path: in
 
+      # mkxnuimg.py assembles BootShim, whose Makefile runs `llvm-objcopy -O binary`.
+      # The image job has no build dependencies of its own, so without this the pack
+      # step died with "make: llvm-objcopy: No such file or directory ... Error 127" --
+      # the same failure the uefi workflow already had to fix.
+      - name: Assemble the boot shim's toolchain
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends llvm make clang
+          # Ubuntu ships a versioned binary (llvm-objcopy-18); the Makefile calls it
+          # unversioned.
+          for v in $(ls /usr/bin/llvm-objcopy-* 2>/dev/null | sed 's/.*-//'); do
+            sudo ln -sf "/usr/bin/llvm-objcopy-$v" /usr/bin/llvm-objcopy
+            break
+          done
+          command -v llvm-objcopy
+          llvm-objcopy --version | head -1
+          command -v clang
+          command -v make
+
       - name: Pack
         run: |
           set -e
