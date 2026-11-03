@@ -225,9 +225,17 @@ jobs:
           # Either way there is no fallback to another phone's prebuilt: mkxnuimg.py would
           # happily use the poco-x5-pro one when UEFI_FD is unset, and that produced an
           # image for the wrong SoC once.
+          # download-artifact@v4 without a run-id only sees THIS run's artifacts, and the
+          # firmware is built by the separate "polaris UEFI" workflow, so in practice the
+          # download above finds nothing. The committed copy under devices/polaris/prebuilt
+          # is what actually supplies it -- the same arrangement poco-x5-pro uses, and the
+          # reason that board's images can be rebuilt without its UEFI tree.
           if [ -f in/SILICIUM_UEFI.fd ]; then
             export UEFI_FD="$PWD/in/SILICIUM_UEFI.fd"
             echo "UEFI_FD from the uefi workflow: $UEFI_FD"
+          elif [ -f devices/polaris/prebuilt/SILICIUM_UEFI.fd ]; then
+            export UEFI_FD="$PWD/devices/polaris/prebuilt/SILICIUM_UEFI.fd"
+            echo "UEFI_FD from devices/polaris/prebuilt: $UEFI_FD"
           fi
           test -n "$UEFI_FD" -a -f "$UEFI_FD" || {
             echo 'No polaris UEFI firmware available.'
@@ -269,6 +277,9 @@ jobs:
           if [ -f in/polaris.dtb ]; then
             export DTB="$PWD/in/polaris.dtb"
             echo "DTB from the uefi workflow: $DTB"
+          elif [ -f devices/polaris/prebuilt/polaris.dtb ]; then
+            export DTB="$PWD/devices/polaris/prebuilt/polaris.dtb"
+            echo "DTB from devices/polaris/prebuilt: $DTB"
           fi
           test -f "$DTB" || { echo "DTB=$DTB does not exist"; exit 1; }
           echo "DTB: $DTB ($(stat -c %s "$DTB") bytes)"
