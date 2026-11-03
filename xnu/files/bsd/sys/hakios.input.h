@@ -37,6 +37,12 @@ struct hakios_touch {
 
 #ifdef KERNEL
 int hakios_is_raphael(void);
+/*
+ * hakios_is_polaris(): whether this kernel runs on the Xiaomi Mi MIX 2S (SDM845).
+ * The loader names the board in /chosen, so drivers can tell the SoCs apart instead of
+ * guessing from addresses. polaris is neither raphael (SM8150) nor redwood (SM7325).
+ */
+int hakios_is_polaris(void);
 void raphael_touch_init(void);
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);

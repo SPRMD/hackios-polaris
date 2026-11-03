@@ -27,6 +27,23 @@ hakios_is_raphael(void)
 	       size == sizeof("raphael") && memcmp(name, "raphael", sizeof("raphael")) == 0;
 }
 
+/*
+ * The loader writes the board's name into /chosen as "hackios,platform"; this asks whether
+ * it says polaris. Kept separate from hakios_is_raphael() rather than folded into one
+ * "which board" function so that every existing caller keeps its meaning.
+ */
+int
+hakios_is_polaris(void)
+{
+	DTEntry chosen;
+	const void *name;
+	unsigned size;
+
+	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	       SecureDTGetProperty(chosen, "hackios,platform", &name, &size) == kSuccess &&
+	       size == sizeof("polaris") && memcmp(name, "polaris", sizeof("polaris")) == 0;
+}
+
 #define TOUCH_QUEUE     512             /* records; a power of two */
 
 /*

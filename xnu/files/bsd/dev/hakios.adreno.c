@@ -4101,6 +4101,38 @@ hakios_adreno_init(void)
 		smmu.phys = 0x02ca0000;
 		smmu.size = 0x10000;
 	}
+	/*
+	 * Xiaomi Mi MIX 2S (polaris, SDM845), an Adreno 630. Every address below is the `reg`
+	 * of the phone's own device tree, taken from the official MIUI 12.5 package, and the
+	 * window names are that tree's `reg-names`:
+	 *
+	 *   kgsl-3d0@5000000  kgsl_3d0_reg_memory   0x05000000 0x40000   (the 3D core)
+	 *                     kgsl_3d0_cx_dbgc_memory 0x05061000 0x800
+	 *                     cx_misc               0x0509e000 0x1000
+	 *   qcom,gmu          kgsl_gmu_reg          0x0506a000 0x30000   (the GMU)
+	 *                     kgsl_gmu_pdc_reg      0x0b200000 0x300000
+	 *   qcom,gpucc@5090000                       0x05090000 0x9000    (GPUCC)
+	 *   arm,smmu-kgsl@5040000                    0x05040000 0x10000   (the GPU's SMMU)
+	 *
+	 * Not set here because the tree has no such window and the raphael/redwood values are
+	 * another SoC's: gbif and rscc. They stay at whatever the defaults are, which the step
+	 * ladder will report when it gets there -- a wrong address must fail loudly at its own
+	 * step, not silently point at memory that belongs to something else.
+	 *
+	 * a640 stays false: this is an A630, and every `a640 ? ... : ...` in this file then
+	 * selects the older variant, which is the right family for this chip.
+	 */
+	else if (hakios_is_polaris()) {
+		gpu.phys = 0x05000000;
+		gpucc.phys = 0x05090000;
+		gmu.phys = 0x0506a000;
+		gmu.size = 0x30000;
+		cx_misc.phys = 0x0509e000;
+		smmu.phys = 0x05040000;
+		smmu.size = 0x10000;
+		pdc.phys = 0x0b200000;
+		pdc.size = 0x300000;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
