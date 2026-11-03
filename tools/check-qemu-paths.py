@@ -32,8 +32,13 @@ def read(rel):
         return f.read()
 
 
-def strip_comments(text):
-    """Blank out comments and string literals, keeping line numbers."""
+def strip_comments(text, keep_strings=False):
+    """Blank out comments, and string literals unless keep_strings, keeping line numbers.
+
+    The other checks want literals gone: a 64-bit address spelled inside a string is not an
+    access to it, and counting those produced false positives. But a check that looks for a
+    particular literal has to keep them, or it silently finds nothing.
+    """
     out = []
     i = 0
     n = len(text)
@@ -54,7 +59,8 @@ def strip_comments(text):
             while j < n and text[j] != q:
                 j += 2 if text[j] == '\\' else 1
             j = min(j + 1, n)
-            out.append(''.join('\n' if c == '\n' else ' ' for c in text[i:j]))
+            out.append(text[i:j] if keep_strings
+                       else ''.join('\n' if c == '\n' else ' ' for c in text[i:j]))
             i = j
         else:
             out.append(text[i])
@@ -193,6 +199,37 @@ def main():
                             'display, so a fault there still goes unreported')
         else:
             findings.append('the exception hook is installed before the display setup')
+
+        # And the hook can only save a fault to storage if the loader has already decided to
+        # keep its log there. flush_log() does nothing when persist_logs is 0, so a fault
+        # between the hook and that assignment is written nowhere -- which is what happened on
+        # polaris: the crash was photographed on the screen and the logdump partition stayed
+        # empty. Both assignments have to be above the hook, and the platform above them,
+        # because persist_logs is derived from it.
+        #
+        # Positions are taken from the body with comments removed but string literals KEPT.
+        # strip_comments() blanks string literals too -- which is what the other checks want,
+        # since an address written in a string is not an access -- but here the thing being
+        # looked for is a literal ("platform="), so blanking it made this check find nothing
+        # and report the order as wrong no matter how the code was written.
+        a, b, body = main_start
+        plain = strip_comments('\n'.join(src.split('\n')[a - 1:b]), keep_strings=True)
+        log_at = plain.find('persist_logs =')
+        plat_at = plain.find('bootarg(')
+        hook_at = plain.find('install_exception_hook()')
+        if log_at < 0:
+            problems.append('efi_main never sets persist_logs, so flush_log() from the exception '
+                            'handler writes nothing and a crash leaves no log behind')
+        elif hook_at >= 0 and hook_at < log_at:
+            problems.append('efi_main installs the exception hook before it decides whether to '
+                            'keep the log on storage (persist_logs), so a fault in between is '
+                            'flushed to nothing')
+        elif plat_at < 0 or plat_at > log_at:
+            problems.append('efi_main sets persist_logs before it reads platform= from the '
+                            'payload, so persist_logs is derived from the wrong platform')
+        else:
+            findings.append('the platform and the log policy are decided before the exception '
+                            'hook can need them')
 
     # The platform has to be decided before it is used. PLAT starts as the QEMU platform, so
     # unless the payload names a real one, the loader would drive virt's GIC at the phone.

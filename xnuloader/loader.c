@@ -4189,22 +4189,19 @@ efi_main(efi_handle image, efi_system_table *st)
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
 	/*
-	 * Before anything that can fault: until now a crash here went to the firmware's own
-	 * handler, which prints nothing on this board, so the first polaris boot ended at a
-	 * bare "Synchronous Exception at 0x...". Everything below reports through this hook.
+	 * Decide the board FIRST, before anything is touched or logged to storage.
+	 *
+	 * The payload's cmdline names it ("platform=polaris"), and that is the only trustworthy
+	 * answer here: raphael and polaris both put their framebuffer at 0x9c000000, so the
+	 * display cannot tell them apart, and a real framebuffer is not evidence of a phone
+	 * either -- the first two polaris boots both died of that inference, once by taking the
+	 * phone for QEMU and once by probing for QEMU the hard way. Reading a string cannot
+	 * fault; probing for a device can.
+	 *
+	 * It comes before the exception hook because the hook's flush_log() needs to know
+	 * whether this board keeps its log on storage, and that is a property of the platform.
 	 */
-	install_exception_hook();
-	print("exception hook: %s\n", exception_hook_installed ? "installed" : "NOT INSTALLED");
-
 	PLAT = &platform_qemu_virt;
-	/*
-	 * Decide the board BEFORE touching anything it owns. The payload's cmdline names it
-	 * ("platform=polaris"), and that is the only trustworthy answer here: raphael and polaris
-	 * both put their framebuffer at 0x9c000000, so the display cannot tell them apart, and a
-	 * real framebuffer is not evidence of a phone either -- the first two polaris boots both
-	 * died of that inference, once by taking the phone for QEMU and once by probing for QEMU
-	 * the hard way. Reading a string cannot fault; probing for a device can.
-	 */
 	{
 		const char *want = bootarg("platform=");
 		if (want != NULL) {
@@ -4219,7 +4216,33 @@ efi_main(efi_handle image, efi_system_table *st)
 			}
 		}
 	}
-	print("platform %s\n", PLAT->name);
+
+	/*
+	 * Decide where the log goes before the hook can use it.
+	 *
+	 * exception_handler() calls flush_log(), and flush_log() only writes when persist_logs is
+	 * set. This used to be assigned far below, after the display setup, so a fault during the
+	 * display setup -- which is exactly where the first polaris crashes happened -- took its
+	 * log nowhere: the screen showed the lines, the logdump partition stayed empty, and the
+	 * only record of the crash was a photograph. Assigning it here means every fault after
+	 * this point can be read back from the phone.
+	 *
+	 * raphael and redwood name log persistence in their platform tables; polaris' GPT has the
+	 * same 64 MB logdump at LBA 49152, so it asks by the same rule. find_log_partition()
+	 * returns NULL where there is none (QEMU) and write_logs() then echoes to the console
+	 * instead, which is what it did before.
+	 */
+	persist_logs = PLAT->log_other_cpu || PLAT == &platform_redwood;
+
+	/*
+	 * Before anything that can fault: until now a crash here went to the firmware's own
+	 * handler, which prints nothing on this board, so the first polaris boot ended at a
+	 * bare "Synchronous Exception at 0x...". Everything below reports through this hook.
+	 */
+	install_exception_hook();
+	print("exception hook: %s\n", exception_hook_installed ? "installed" : "NOT INSTALLED");
+	print("platform %s (log %s)\n", PLAT->name,
+	    persist_logs ? "kept on the phone" : "console only");
 
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
@@ -4246,7 +4269,7 @@ efi_main(efi_handle image, efi_system_table *st)
 			    (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 		}
 	}
-	persist_logs = PLAT == &platform_redwood;
+	/* persist_logs was set above, before the exception hook went in; see there. */
 
 	/* The hook went in before the display, which is what can fault on hardware. */
 	if (PLAT == &platform_raphael) {
