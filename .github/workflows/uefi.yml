@@ -42,11 +42,19 @@ jobs:
             git ca-certificates curl xz-utils
           python3 --version
 
-      - name: Clone Mu-Silicium and its Binaries submodule
+      - name: Clone Mu-Silicium and its submodules
         run: |
           set -e
           # Not /mnt: it exists on this image but is not writable by the runner user, which
           # costs a whole run to discover. RUNNER_TEMP is on the large volume and is ours.
+          #
+          # The submodules are needed -- the DSC pulls MdeModulePkg/ArmPkg/EmbeddedPkg out of
+          # Common/Mu and Mu_Basecore -- and they are big: mu_basecore 330 MB, Device-Binaries
+          # 131 MB, mu_plus 18 MB, Silicium-ACPI 5 MB. So they are shallow and fetched in
+          # parallel; serial --depth 1 was still running after seven minutes.
+          #
+          # build_uefi.py's own `git submodule update` only runs with -u, which is not passed,
+          # so this is the only place submodules are populated.
           cd "$RUNNER_TEMP"
           BASE="$(cat "$GITHUB_WORKSPACE/devices/polaris/uefi/BASE")"
           echo "BASE=$BASE"
@@ -55,11 +63,20 @@ jobs:
           git remote add origin "$MU_REPO"
           git fetch -q --depth 1 origin "$BASE"
           git checkout -q FETCH_HEAD
-          git submodule update -q --init --recursive --depth 1
-          echo "--- checked out ---"
           git log --oneline -1
-          test -d Binaries/polaris || { echo "no Binaries/polaris in the submodule"; exit 1; }
-          ls Binaries/polaris
+
+          echo "--- submodules, shallow and parallel ---"
+          date +%T
+          git submodule update --init --depth 1 --jobs 4 --recommend-shallow
+          date +%T
+          test -d Binaries/polaris || { echo "no Binaries/polaris after the submodule update"; exit 1; }
+          echo "polaris drivers: $(find Binaries/polaris -name '*.inf' | wc -l) .inf files"
+          # The EDK2 packages the DSC includes. If one is missing the build fails deep inside
+          # stuart with a confusing message, so say it here instead.
+          for d in Common/Mu Mu_Basecore Common/Mu_OEM_Sample; do
+            test -d "$d" || { echo "missing submodule: $d"; exit 1; }
+            echo "present: $d"
+          done
           du -sh . Binaries
 
       - name: Put the polaris port into the tree
