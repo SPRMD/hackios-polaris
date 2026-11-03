@@ -187,8 +187,9 @@ jobs:
     name: pack boot.img
     needs: [kernel, loader]
     # The UEFI firmware volume is board-specific and built by the uefi workflow, which is
-    # a separate dispatch because its tree is ~5 GB. It is passed in rather than switched
-    # on, because a repository_dispatch/workflow_run dependency would couple the two.
+    # a separate dispatch because its tree is ~5 GB. That workflow cannot hand its artifact
+    # to this run (download-artifact sees only the current run), so this job uses the copy
+    # checked in at devices/polaris/prebuilt -- see the Pack step for the exact source.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -199,12 +200,17 @@ jobs:
         with:
           path: in
 
-      - name: Fetch the polaris UEFI firmware, if the uefi workflow has produced one
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: polaris-SILICIUM_UEFI.fd
-          path: in
+      # The firmware is NOT downloaded here. actions/download-artifact@v4 without a run-id
+      # sees only this run's artifacts, and the firmware is built by the separate "polaris
+      # UEFI" workflow, so a step that tried produced, on every single run:
+      #
+      #   Unable to download artifact(s): Artifact not found for name:
+      #   polaris-SILICIUM_UEFI.fd
+      #
+      # That was hidden behind continue-on-error, which meant a real failure to fetch would
+      # have been equally silent. The firmware comes from devices/polaris/prebuilt (see the
+      # Pack step); the "polaris UEFI" workflow's artifact is still worth downloading by hand
+      # when it changes, and dist/refresh-polaris-firmware.sh copies it there.
 
       # mkxnuimg.py assembles BootShim, whose Makefile runs `llvm-objcopy -O binary`.
       # The image job has no build dependencies of its own, so without this the pack
@@ -247,27 +253,22 @@ jobs:
           test -n "$UEFI_TARGET" || { echo 'UEFI_TARGET not set by device.conf'; exit 1; }
           test -n "$FD_BASE" || { echo 'FD_BASE not set by device.conf'; exit 1; }
 
-          # The UEFI firmware must be polaris'. If one was downloaded from the uefi
-          # workflow it is at in/SILICIUM_UEFI.fd; otherwise UEFI_FD must name a real file.
-          # Either way there is no fallback to another phone's prebuilt: mkxnuimg.py would
-          # happily use the poco-x5-pro one when UEFI_FD is unset, and that produced an
-          # image for the wrong SoC once.
-          # download-artifact@v4 without a run-id only sees THIS run's artifacts, and the
-          # firmware is built by the separate "polaris UEFI" workflow, so in practice the
-          # download above finds nothing. The committed copy under devices/polaris/prebuilt
-          # is what actually supplies it -- the same arrangement poco-x5-pro uses, and the
-          # reason that board's images can be rebuilt without its UEFI tree.
-          if [ -f in/SILICIUM_UEFI.fd ]; then
-            export UEFI_FD="$PWD/in/SILICIUM_UEFI.fd"
-            echo "UEFI_FD from the uefi workflow: $UEFI_FD"
-          elif [ -f devices/polaris/prebuilt/SILICIUM_UEFI.fd ]; then
+          # The UEFI firmware must be polaris', and it comes from devices/polaris/prebuilt.
+          # There is deliberately no fallback to another phone's prebuilt: mkxnuimg.py would
+          # happily use the poco-x5-pro one when UEFI_FD is unset, and that produced an image
+          # for the wrong SoC once. A caller may still point UEFI_FD at a freshly built
+          # volume (dist/refresh-polaris-firmware.sh does that), which wins over prebuilt.
+          if [ -z "$UEFI_FD" ] && [ -f devices/polaris/prebuilt/SILICIUM_UEFI.fd ]; then
             export UEFI_FD="$PWD/devices/polaris/prebuilt/SILICIUM_UEFI.fd"
-            echo "UEFI_FD from devices/polaris/prebuilt: $UEFI_FD"
+          fi
+          if [ -n "$UEFI_FD" ]; then
+            echo "UEFI_FD: $UEFI_FD"
           fi
           test -n "$UEFI_FD" -a -f "$UEFI_FD" || {
             echo 'No polaris UEFI firmware available.'
-            echo 'Run the "polaris UEFI" workflow, or set UEFI_FD to a built'
-            echo 'SILICIUM_UEFI.fd. Refusing to fall back to the redwood prebuilt.'
+            echo 'Build one with the "polaris UEFI" workflow and put it at'
+            echo 'devices/polaris/prebuilt/SILICIUM_UEFI.fd, or set UEFI_FD.'
+            echo 'Refusing to fall back to the redwood prebuilt.'
             exit 1
           }
           FD_ACTUAL=$(stat -c %s "$UEFI_FD")
@@ -296,18 +297,11 @@ jobs:
             loader.efi=in/loader.efi/loader.efi \
             kernel=in/mach.development.bcm2837/mach.development.bcm2837
 
-          # The device tree. device.conf names out/polaris/polaris.dtb, and nothing in this
-          # repository produces it, so prefer the one the uefi workflow built against and
-          # shipped beside the firmware. Without this fallback mkxnuimg.py would reach into
-          # Mu-Silicium/Resources/DTBs and use whatever it found there, which is the kind of
-          # silent substitution that produced a redwood image once already.
-          if [ -f in/polaris.dtb ]; then
-            export DTB="$PWD/in/polaris.dtb"
-            echo "DTB from the uefi workflow: $DTB"
-          elif [ -f devices/polaris/prebuilt/polaris.dtb ]; then
-            export DTB="$PWD/devices/polaris/prebuilt/polaris.dtb"
-            echo "DTB from devices/polaris/prebuilt: $DTB"
-          fi
+          # The device tree. device.conf names out/polaris/polaris.dtb, and this job does not
+          # produce it, so use the prebuilt checked in next to the firmware. Anything else
+          # would let mkxnuimg.py reach into Mu-Silicium/Resources/DTBs and silently use
+          # whatever it found there, which is what produced a redwood image once already.
+          export DTB="$PWD/devices/polaris/prebuilt/polaris.dtb"
           test -f "$DTB" || { echo "DTB=$DTB does not exist"; exit 1; }
           echo "DTB: $DTB ($(stat -c %s "$DTB") bytes)"
           head -c 4 "$DTB" | od -An -tx1 | grep -q 'd0 0d fe ed' \
@@ -361,9 +355,8 @@ jobs:
               assert name in blob[i:i + csize], "payload has no %r entry" % name
           print("payload entries: loader.efi kernel cmdline -- all present")
           assert b"platform=polaris" in blob[i:i + csize], "cmdline does not name the platform"
-          # The DTB follows the gzip member inside the kernel field; report whether the
-          # bootloader will find one, without insisting on it (a shim-only image has none).
-          rest = body[len(body) - (len(body) - len(gzip.compress(b""))) :] if False else None
+          # The DTB follows the gzip member inside the kernel field; the checks below require
+          # it, because without a device tree the kernel cannot find the hardware at all.
           # The board must be polaris, not a leftover prebuilt for another phone. The
           # appended device tree is the cheapest proof: it names its own SoC.
           assert len(tail) > 8, "no device tree appended"
