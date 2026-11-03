@@ -382,10 +382,20 @@ cmd_db_map(void)
 	}
 	if (polaris) {
 		vm_offset_t descriptor = ml_io_map_wcomb(CMD_DB_DESCRIPTOR_PHYS, 8);
-		uint32_t start = rd(descriptor);
-		uint32_t length = rd(descriptor + 4);
+		uint32_t start, length;
 
-		if (start == 0 || length < 0x100 || length > 0x400000) {
+		if (descriptor == 0) {
+			printf("adreno: %u: the cmd-db descriptor at %#lx could not be mapped\n", step,
+			    (unsigned long)CMD_DB_DESCRIPTOR_PHYS);
+			return false;
+		}
+		start = rd(descriptor);
+		length = rd(descriptor + 4);
+		/*
+		 * A length below 0x1000 is not a cmd-db, and the same bound keeps the "- 0x1000" in
+		 * rpmh_resource() from underflowing into a very large unsigned.
+		 */
+		if (start == 0 || length < 0x1000 || length > 0x400000) {
 			printf("adreno: %u: the cmd-db descriptor at %#lx says %#x/%#x: no table to read\n", step,
 			    (unsigned long)CMD_DB_DESCRIPTOR_PHYS, start, length);
 			return false;
@@ -396,7 +406,7 @@ cmd_db_map(void)
 		cmd_db_size = length;
 	}
 	cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(phys, cmd_db_size);  /* memory, not registers */
-	return true;
+	return cmd_db != NULL;
 }
 
 /*
