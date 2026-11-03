@@ -42,8 +42,10 @@ jobs:
       - name: Disk space
         run: |
           df -h /
+          # AGENT_TOOLSDIRECTORY is not set on every runner; an unset name under `set -e`
+          # would abort the step, so it is expanded defensively.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+            /usr/local/share/boost ${AGENT_TOOLSDIRECTORY:+"$AGENT_TOOLSDIRECTORY"} || true
           df -h /
 
       - name: Toolchain
@@ -57,26 +59,26 @@ jobs:
 
       - name: Theos (cctools for the Mach-O link, and the iPhoneOS SDK)
         run: |
-          set -e
+          set -euo pipefail
           export THEOS="$HOME/theos"
           git clone -q --recursive https://github.com/theos/theos.git "$THEOS"
-          mkdir -p "$THEOS/toolchain"
-          url=https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz
+          # The Linux iOS toolchain is published by L1ghtmann/llvm-project, which is what
+          # theos' own bin/install-theos fetches (install-theos L461). There is no
+          # theos/toolchain repository, so a URL under it is a 404.
+          url=https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
           echo "downloading $url"
-          curl -L --fail --retry 3 -o /tmp/tc.tar.xz "$url"
-          tar -xJf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+          curl -sL --fail --retry 3 "$url" | tar -xJ -C "$THEOS/toolchain/"
           ls "$THEOS/toolchain"
-          # the cctools the kernel build needs (ld64, nm, otool, strip, ...)
+          ls "$THEOS/toolchain/linux/iphone/bin" | head -20
           test -x "$THEOS/toolchain/linux/iphone/bin/ld" \
             || { echo "no cctools at \$THEOS/toolchain/linux/iphone/bin"; exit 1; }
-          # the SDK the kernel is compiled against
-          git clone -q --depth 1 --filter=blob:none --sparse \
-            https://github.com/theos/sdks.git "$THEOS/sdks-git"
-          git -C "$THEOS/sdks-git" sparse-checkout set iPhoneOS16.5.sdk
-          mkdir -p "$THEOS/sdks"
-          ln -sfn ../sdks-git/iPhoneOS16.5.sdk "$THEOS/sdks/iPhoneOS16.5.sdk"
-          test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" || { echo "no SDK"; exit 1; }
-          du -sh "$THEOS/toolchain" "$THEOS/sdks-git"
+          # The SDK the kernel is compiled against: theos' own installer, which knows the
+          # current release URL for the patched SDKs.
+          "$THEOS/bin/install-sdk" 16.5 || "$THEOS/bin/install-sdk" latest
+          ls "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" \
+            || { echo "no iPhoneOS16.5.sdk in \$THEOS/sdks"; ls -la "$THEOS/sdks"; exit 1; }
+          du -sh "$THEOS/toolchain" "$THEOS/sdks"
 
       - name: Apply the work to Apple's XNU
         run: |
