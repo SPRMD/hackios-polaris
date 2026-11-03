@@ -35,17 +35,35 @@ ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
 fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
-    shim_dir = os.path.join(MU, 'BootShim')
+# The shim is 42 lines of assembly whose only job is to copy the FD to FD_BASE and jump to
+# it, and it has to be assembled with THIS board's FD_BASE/FD_SIZE/PAYLOAD_BASE. A full
+# Mu-Silicium tree is one place to get it; devices/<name>/prebuilt/BootShim is the other,
+# so an image can be rebuilt from the committed firmware alone. Without this fallback the
+# kernel workflow's pack step could not run at all: it has no Mu-Silicium tree, so it fell
+# through to the refusal below even though it had been handed a correct FD and DTB.
+SHIM_FALLBACK = os.path.join(HERE, 'devices', TARGET, 'prebuilt', 'BootShim')
+shim_dir = os.path.join(MU, 'BootShim')
+if not os.path.isdir(shim_dir) and os.path.isfile(os.path.join(SHIM_FALLBACK, 'BootShim.S')):
+    shim_dir = SHIM_FALLBACK
+if os.path.isfile(fd_path) and os.path.isdir(shim_dir):
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
         except FileNotFoundError: pass
     subprocess.check_call(['make', 'REQUIRES_KERNEL_HEADER=1', f'FD_BASE={FD_BASE:#x}', f'FD_SIZE={FD_SIZE:#x}',
                            f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
+    # The DTB and mkbootimg come from the Mu-Silicium tree when there is one; otherwise take
+    # the DTB the caller exported (device.conf names it, and prebuilt supplies it).
+    dtb_path = os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb')
+    if not os.path.isfile(dtb_path):
+        dtb_path = os.environ.get('DTB') or dtb_path
     parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
-             'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'dtb': dtb_path, 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
+    if not os.path.isfile(parts['mkbootimg']):
+        parts['mkbootimg'] = os.path.join(PREBUILT, 'mkbootimg.py')
+    if not os.path.isfile(parts['ramdisk']):
+        parts['ramdisk'] = os.path.join(PREBUILT, 'ramdisk')
 else:
     if TARGET != 'redwood':
         sys.exit(f'mkxnuimg: {TARGET} needs its own built UEFI and Mu-Silicium/BootShim; refusing redwood prebuilts')
