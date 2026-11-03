@@ -114,11 +114,15 @@ def main(argv):
 
     # 1. The pin controller. Every GPIO number in this port is an offset into this window,
     #    so a wrong base turns a touch reset into a write into whatever else lives there.
-    tlmm = find(nodes, 'pinctrl@3400000')
+    #
+    #    It is found by its `reg`, not by its node name: the live tree spells the node
+    #    pinctrl@03400000 with a leading zero and the source spells it pinctrl@03400000 too,
+    #    but a name-based lookup is one rename away from silently checking nothing.
+    tlmm = [p for p in nodes if 'reg' in nodes[p] and len(nodes[p]['reg']) >= 4
+            and cell(nodes[p]['reg'], 0) == 0x3400000 and 'soc' in p]
     if tlmm:
-        reg = nodes[tlmm[0]].get('reg', b'')
-        base = cell(reg, 0)
-        notes.append('live pinctrl@3400000 reg[0] = %#x' % base)
+        base = cell(nodes[tlmm[0]]['reg'], 0)
+        notes.append('live pin controller %s reg[0] = %#x' % (tlmm[0], base))
         src = read('sdm845-pinctrl.txt') or ''
         m = re.search(r'pinctrl@0*([0-9a-fA-F]+)\s*\{', src)
         if m:
@@ -131,15 +135,35 @@ def main(argv):
         else:
             notes.append('source pinctrl base not found -- not compared')
     else:
-        problems.append('the live tree has no pinctrl@3400000 node')
+        problems.append('the live tree has no pin controller at 0x3400000, which is the base '
+                        'every GPIO number in this port is an offset into')
 
     # 2. The touch controller. The port's kernel has no polaris touch driver yet, so this
     #    records where one has to attach: the source names the bus, the address, the two
     #    GPIOs and the interrupt, and the live tree has to have the same bus.
+    #
+    #    Found by scanning for the node directly rather than with one regular expression over
+    #    the whole file. The obvious pattern -- a `&bus { ... synaptics_ ...@addr {` with the
+    #    middle written as (?:[^}]*\n)*? -- has two nested quantifiers and backtracks
+    #    catastrophically on a 21 KB file: it ran for minutes without finishing. Indexing on
+    #    the markers is linear and says the same thing.
     src = read('polaris-p0.dtsi') or ''
-    m = re.search(r'&(\w+)\s*\{\s*\n(?:[^}]*\n)*?synaptics_\w+@([0-9a-fA-F]+)\s*\{', src)
-    if m:
-        bus, addr = m.group(1), int(m.group(2), 16)
+    bus = addr = None
+    at = src.find('synaptics_dsi_i2c@')
+    if at < 0:
+        at = src.find('synaptics_')
+    if at >= 0:
+        line_start = src.rfind('\n', 0, at) + 1
+        m = re.match(r'\s*synaptics_\w+@([0-9a-fA-F]+)', src[line_start:line_start + 64])
+        if m:
+            addr = int(m.group(1), 16)
+            # The enclosing `&label {` is the nearest one above that opens a node. Searching
+            # for the last '&' before the line does not work: the touch node's own body is
+            # full of `&tlmm` phandles, and the first version of this picked one of them up
+            # and compared against a bus named "tlmm". Only a `&name {` counts.
+            for m2 in re.finditer(r'&(\w+)\s*\{', src[:line_start]):
+                bus = m2.group(1)
+    if bus is not None and addr is not None:
         notes.append('source touch: %s, I2C address %#x' % (bus, addr))
         irq = re.search(r'synaptics,irq-gpio\s*=\s*<&tlmm\s+(\d+)', src)
         rst = re.search(r'synaptics,reset-gpio\s*=\s*<&tlmm\s+(\d+)', src)
@@ -189,11 +213,11 @@ def main(argv):
     else:
         problems.append('the live tree has no interrupt-controller@17a00000 node')
 
-    if verbose:
-        print('board tree:')
-        for n in notes:
-            print('  ' + n)
     if problems:
+        if verbose:
+            print('board tree:')
+            for n in notes:
+                print('  ' + n)
         print('PROBLEMS from the live tree:')
         for p in problems:
             print('  - ' + p)
