@@ -7,15 +7,32 @@ name: kernel
 #
 # Two jobs: `patch` is fast and answers "does the work still apply to Apple's tag"; `kernel` is
 # the real build and uploads the Mach-O. `kernel` needs `patch` to pass first.
+#
+# Fast lane. Changing anything in the pack stage -- the boot shim, an address, the cmdline, a
+# tool -- still has to go through the two build jobs, which cost about ten minutes and, before
+# artifacts expire, produce byte-identical output each time. Dispatch this workflow with
+# `reuse_run_id` set to an earlier run's id and the build jobs are skipped: the image job
+# downloads that run's kernel and loader instead of this run's. Only touch it when the kernel
+# itself changed.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: >-
+          Fast lane: the id of an earlier run of this workflow whose kernel and loader
+          artifacts should be reused instead of rebuilding them. Leave empty to build.
+        required: false
+        default: ''
+        type: string
 
 jobs:
   patch:
     name: the work applies to Apple's tag
+    # Skipped in the fast lane: nothing is being rebuilt, so there is nothing to patch.
+    if: inputs.reuse_run_id == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +51,10 @@ jobs:
   loader:
     name: build the loader
     needs: patch
+    # `needs: patch` plus this job's own condition: a skipped `patch` would otherwise skip this
+    # job too (GitHub skips dependents of a skipped job), but an explicit `always()` on the
+    # condition is not wanted here either -- the fast lane must skip it, a normal run must not.
+    if: always() && inputs.reuse_run_id == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -77,6 +98,7 @@ jobs:
   kernel:
     name: build the kernel
     needs: patch
+    if: always() && inputs.reuse_run_id == ''
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -185,7 +207,11 @@ jobs:
   # boot image.
   image:
     name: pack boot.img
+    # In the fast lane the build jobs are skipped, so `needs` is satisfied by their being
+    # skipped rather than successful -- which is what we want, and is why the condition below
+    # allows it explicitly instead of relying on the default success().
     needs: [kernel, loader]
+    if: always() && (inputs.reuse_run_id != '' || (needs.kernel.result == 'success' && needs.loader.result == 'success'))
     # The UEFI firmware volume is board-specific and built by the uefi workflow, which is
     # a separate dispatch because its tree is ~5 GB. That workflow cannot hand its artifact
     # to this run (download-artifact sees only the current run), so this job uses the copy
@@ -199,6 +225,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: in
+          # In the fast lane these come from an earlier run. `run-id` is what makes that
+          # possible: without it download-artifact searches only the current run, which is why
+          # the firmware download that used to be here failed on every single run.
+          run-id: ${{ inputs.reuse_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Say where the kernel and the loader came from
+        run: |
+          set -e
+          if [ -n "${{ inputs.reuse_run_id }}" ]; then
+            echo "reused run ${{ inputs.reuse_run_id }}: nothing was built in this run"
+          else
+            echo "built in this run (${{ github.run_id }})"
+          fi
+          ls -l in/
 
       # The firmware is NOT downloaded here. actions/download-artifact@v4 without a run-id
       # sees only this run's artifacts, and the firmware is built by the separate "polaris
