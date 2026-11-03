@@ -174,17 +174,22 @@ def main(argv):
             ok = False
 
     # The payload must sit immediately after the FD, which is what the shim assumes when it
-    # adds FD_SIZE to the FD's address.
+    # adds FD_SIZE to the FD's address. The packer pads the blob out to a 16-byte boundary, so
+    # the tail may carry up to 15 zero bytes beyond the payload itself.
     pay = blob[fv_off + fv_len:]
     print('  payload after the FD: %d bytes, starts %r' % (len(pay), pay[:4]))
     if pay[:4] != b'XNUP':
         print('  the payload is not at FD + FD_SIZE where the shim looks for it')
         ok = False
-    elif payload_size is not None and len(pay) != payload_size:
-        print('  PAYLOAD_SIZE is %d but the payload is %d bytes' % (payload_size, len(pay)))
-        ok = False
-    else:
-        print('  PAYLOAD_SIZE matches the payload exactly')
+    elif payload_size is not None:
+        pad = len(pay) - payload_size
+        if not 0 <= pad < 16 or pay[payload_size:].strip(b'\0'):
+            print('  PAYLOAD_SIZE is %d but the payload is %d bytes (padding %d)'
+                  % (payload_size, len(pay), pad))
+            ok = False
+        else:
+            print('  PAYLOAD_SIZE matches the payload (%d bytes, %d of padding)'
+                  % (payload_size, pad))
 
     print()
     print('  RESULT:', 'the shim places the FD and the payload as intended' if ok
