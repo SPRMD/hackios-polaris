@@ -2520,11 +2520,15 @@ exception_handler(int64_t type, uint64_t *ctx)
 {
 	/*
 	 * A fault taken inside fw_cfg_present() is the answer to its question, not a failure:
-	 * the address is not mapped, so this is hardware, not QEMU. Skip the faulting load and
-	 * let the probe return "no". Everything else is a real crash and is reported.
+	 * the address is not mapped, so this is hardware, not QEMU. Skip the faulting access and
+	 * let the probe see the flag.
+	 *
+	 * The flag is deliberately NOT cleared here. The probe makes more than one access, and
+	 * every one of them faults on hardware; clearing it on the first fault let the second
+	 * one through to the reset below, which is how the fix for the first crash produced a
+	 * second one at the same function. fw_cfg_present() clears it when it gives up.
 	 */
 	if (fw_cfg_probe_active && type == 0) {
-		fw_cfg_probe_active = 0;
 		fw_cfg_probe_faulted = 1;
 		ctx[EXC_CTX_ELR] += 4;
 		return;
@@ -4056,20 +4060,37 @@ static int
 fw_cfg_present(void)
 {
 	static const char want[4] = { 'Q', 'E', 'M', 'U' };
-	char got[4];
+	volatile char got[4];
 	int ok = 1;
 
 	if (!exception_hook_installed) {
 		return 0;                       /* cannot probe safely: assume hardware */
 	}
 	__asm__ volatile ("dmb sy" ::: "memory");
-	fw_cfg_probe_active = 1;
 	fw_cfg_probe_faulted = 0;
+	fw_cfg_probe_active = 1;
+	__asm__ volatile ("dmb sy" ::: "memory");
+
+	/*
+	 * Every access here faults on hardware, and the handler above skips just the faulting
+	 * instruction -- so each one has to be followed by a check, or the probe walks into the
+	 * next fault. The selector write comes first only because QEMU needs it before the data
+	 * is read; the reads below are what actually decide the answer.
+	 */
 	*(volatile uint16_t *)(FW_CFG_BASE + 8) = __builtin_bswap16(FW_CFG_FILE_DIR);
+	__asm__ volatile ("dmb sy" ::: "memory");
+	if (fw_cfg_probe_faulted) {
+		fw_cfg_probe_active = 0;
+		return 0;
+	}
 	for (int i = 0; i < 4; i++) {
 		got[i] = *(volatile char *)(FW_CFG_BASE + i);
+		__asm__ volatile ("dmb sy" ::: "memory");
+		if (fw_cfg_probe_faulted) {
+			fw_cfg_probe_active = 0;
+			return 0;
+		}
 	}
-	__asm__ volatile ("dmb sy" ::: "memory");
 	fw_cfg_probe_active = 0;
 	if (fw_cfg_probe_faulted) {
 		return 0;

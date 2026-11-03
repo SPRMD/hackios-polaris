@@ -139,6 +139,30 @@ def main():
     else:
         findings.append('the exception handler answers the probe fault instead of resetting')
 
+    # The handler skips one faulting instruction, so the probe has to stop at the first fault.
+    # A probe that makes several QEMU-only accesses and checks the flag only at the end walks
+    # into the next fault as soon as the first one is skipped -- which is exactly what happened
+    # on the second polaris boot, at the same function as the first crash.
+    m = re.search(r'\nstatic int\s*\nfw_cfg_present\(void\)\s*\n\{(.*?)\n\}', code, re.S)
+    if not m:
+        problems.append('could not find fw_cfg_present(); the check needs updating')
+    else:
+        body = m.group(1)
+        accesses = len(re.findall(r'FW_CFG_BASE', body))
+        checks = len(re.findall(r'fw_cfg_probe_faulted', body))
+        findings.append(f'fw_cfg_present() makes {accesses} QEMU-only access(es) and checks the '
+                        f'fault flag {checks} time(s)')
+        if accesses > 1 and checks < accesses:
+            problems.append(f'fw_cfg_present() makes {accesses} accesses but checks the fault flag '
+                            f'only {checks} time(s): the first fault is skipped by the handler and '
+                            f'the probe then walks straight into the next one, which resets the '
+                            f'machine. Check after every access.')
+    # And the handler must not clear the flag itself: the probe owns its lifetime.
+    m = re.search(r'if\s*\(\s*fw_cfg_probe_active\b.*?\n(\t.*?\n)+?\t\}', code, re.S)
+    if m and re.search(r'fw_cfg_probe_active\s*=\s*0', m.group(0)):
+        problems.append('the exception handler clears fw_cfg_probe_active itself, so only the '
+                        'first fault of the probe is handled and later ones reset the machine')
+
     # The hook has to be installed before anything that can fault.
     main_start = None
     for name, a, b, body in funcs:
