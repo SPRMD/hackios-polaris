@@ -4187,6 +4187,30 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("exception hook: %s\n", exception_hook_installed ? "installed" : "NOT INSTALLED");
 
 	PLAT = &platform_qemu_virt;
+	/*
+	 * Decide the board BEFORE touching anything it owns. The payload's cmdline names it
+	 * ("platform=polaris"), and that is the only trustworthy answer here: raphael and polaris
+	 * both put their framebuffer at 0x9c000000, so the display cannot tell them apart, and a
+	 * real framebuffer is not evidence of a phone either -- the first two polaris boots both
+	 * died of that inference, once by taking the phone for QEMU and once by probing for QEMU
+	 * the hard way. Reading a string cannot fault; probing for a device can.
+	 */
+	{
+		const char *want = bootarg("platform=");
+		if (want != NULL) {
+			if (str_eq(want, "polaris") || starts_with(want, "polaris ")) {
+				PLAT = &platform_polaris;
+			} else if (str_eq(want, "raphael") || starts_with(want, "raphael ")) {
+				PLAT = &platform_raphael;
+			} else if (str_eq(want, "redwood") || starts_with(want, "redwood ")) {
+				PLAT = &platform_redwood;
+			} else if (str_eq(want, "qemu") || starts_with(want, "qemu ")) {
+				PLAT = &platform_qemu_virt;
+			}
+		}
+	}
+	print("platform %s\n", PLAT->name);
+
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -4196,41 +4220,22 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		/*
-		 * ramfb is QEMU's, and fw_cfg is how it is asked: on hardware that address is
-		 * unmapped, so it must be probed rather than assumed. A real framebuffer is not
-		 * evidence of QEMU -- that inversion is what crashed the first polaris boot.
+		 * ramfb is QEMU's alone, so it is reached only when the platform is QEMU's. On a
+		 * phone the firmware's own mode is used untouched, which is also what the display
+		 * driver inside the kernel wants to find.
 		 */
-		if (fw_cfg_present()) {
-			print("fw_cfg present: QEMU, reshaping the display for ramfb\n");
-			ramfb_phone_screen();
-		} else {
-			print("no fw_cfg: a real panel, using the firmware's framebuffer\n");
-		}
-		/*
-		 * The block above cannot tell raphael from polaris: both put the framebuffer at
-		 * 0x9c000000, and the outer test (0xE1000000) is mutually exclusive with the inner
-		 * one (0x9c000000), so on a phone it never selects anything. Until the two boards
-		 * are told apart by something that is actually theirs -- polaris' XBL memory map,
-		 * or a DT compatible the loader can read -- the platform is named explicitly.
-		 *
-		 * payload.cmdline: "platform=polaris" or "platform=raphael". Absent, behaviour is
-		 * unchanged, so nothing that works today can break by this.
-		 */
-		{
-			const char *want = bootarg("platform=");
-			if (want != NULL) {
-				if (str_eq(want, "polaris") || starts_with(want, "polaris ")) {
-					PLAT = &platform_polaris;
-				} else if (str_eq(want, "raphael") || starts_with(want, "raphael ")) {
-					PLAT = &platform_raphael;
-				} else if (str_eq(want, "redwood") || starts_with(want, "redwood ")) {
-					PLAT = &platform_redwood;
-				}
+		if (PLAT == &platform_qemu_virt) {
+			if (fw_cfg_present()) {
+				print("fw_cfg present: reshaping the display for ramfb\n");
+				ramfb_phone_screen();
+			} else {
+				print("no fw_cfg: leaving the firmware's display alone\n");
 			}
+		} else {
+			print("board display %d x %d at %x, left as the firmware set it\n",
+			    (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 		}
-		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
-	print("platform %s\n", PLAT->name);
 	persist_logs = PLAT == &platform_redwood;
 
 	/* The hook went in before the display, which is what can fault on hardware. */

@@ -122,12 +122,26 @@ def main():
     # The gate itself: ramfb must be called only inside `if (fw_cfg_present())`.
     m = re.search(r'if\s*\(\s*fw_cfg_present\s*\(\s*\)\s*\)\s*\{?\s*\n?(.{0,400})', code, re.S)
     if not m:
-        problems.append('efi_main does not gate ramfb_phone_screen() on fw_cfg_present()')
+        problems.append('efi_main does not gate ramfb on fw_cfg_present()')
     elif 'ramfb_phone_screen' not in m.group(1):
         problems.append('the fw_cfg_present() branch does not call ramfb_phone_screen(); the '
                         'gate and the code it guards have come apart')
     else:
-        findings.append('ramfb_phone_screen() is called only inside `if (fw_cfg_present())`')
+        findings.append('ramfb_phone_screen() is reached only through fw_cfg_present()')
+
+    # ...and in turn the probe must be inside `if (PLAT == &platform_qemu_virt)`. Reading the
+    # board's name out of the cmdline cannot fault; asking a device whether it exists can, and
+    # the phone answers by faulting. The board name is the primary gate and the probe is only
+    # the secondary one.
+    m2 = re.search(r'if\s*\(\s*PLAT\s*==\s*&platform_qemu_virt\s*\)\s*\{(.{0,600})', code, re.S)
+    if not m2:
+        problems.append('ramfb is not gated on the platform being QEMU’s: the platform is known '
+                        'from payload.cmdline, so use it instead of probing the device')
+    elif 'ramfb_phone_screen' not in m2.group(1):
+        problems.append('the PLAT == &platform_qemu_virt branch does not lead to '
+                        'ramfb_phone_screen()')
+    else:
+        findings.append('ramfb_phone_screen() is reached only when the platform is QEMU’s')
 
     # A probe that faults is pointless unless a handler turns the fault into an answer.
     if 'fw_cfg_probe_active' not in code:
