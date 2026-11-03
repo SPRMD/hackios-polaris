@@ -190,6 +190,12 @@ jobs:
           fi
           echo "FD size matches device.conf and it is polaris firmware"
 
+          # Walk the volume itself: header checksum, block map, every FFS file header, then
+          # decompress the LZMA section and look for the overlay's own markers in it. A string
+          # search over the .fd cannot see them -- they live inside that compressed section --
+          # so without this a build that silently lost the port would pass as a valid volume.
+          python3 "$GITHUB_WORKSPACE/tools/check-fv.py" "$GITHUB_WORKSPACE/out/SILICIUM_UEFI.fd"
+
           # The device tree the image will be packed with. Take Mu-Silicium's polaris.dtb as
           # delivered and confirm it describes this SoC, so the image job gets a DTB that is
           # named and checked rather than one that mkxnuimg.py happens to find.
