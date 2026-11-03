@@ -73,7 +73,8 @@ def decode_slot(blob):
                       'instruction and it cannot know its own load address')
     if (br & 0xFC000000) != 0x14000000:
         return None, 'the shim\'s second instruction is not a branch (got %08x)' % br
-    target = (br & 0x3FFFFFF) * 4
+    # B is relative to the branch instruction itself, which sits at offset 4.
+    target = 4 + (br & 0x3FFFFFF) * 4
     if target & 0x8000000:
         target -= 0x10000000
     if target + 8 > len(blob):

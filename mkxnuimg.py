@@ -62,7 +62,8 @@ def shim_slot_from_code(shim):
     if (br & 0xFC000000) != 0x14000000:
         sys.exit('mkxnuimg: the second instruction of the boot shim is not a branch, which would '
                  'push the arm64 Image header off its fixed offset')
-    target = (br & 0x3FFFFFF) * 4
+    # B is relative to the branch instruction itself, which sits at offset 4.
+    target = 4 + (br & 0x3FFFFFF) * 4
     if target & 0x8000000:
         target -= 0x10000000
     if target + 8 > len(shim):
