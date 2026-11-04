@@ -44,6 +44,8 @@ int hakios_is_raphael(void);
  */
 int hakios_is_polaris(void);
 void raphael_touch_init(void);
+/* the Mi MIX 2S's Synaptics S3330 over QUPv3 SE14 (bsd/dev/polaris_touch.c) */
+void polaris_touch_init(void);
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_input_init(void);

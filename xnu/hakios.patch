@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..f850e6a55a77 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,43 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,44 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -73,6 +73,7 @@ index 44274016a4cf..f850e6a55a77 100644
 +bsd/dev/hakios.virtio_input.c	standard
 +bsd/dev/hakios.goodix.c	standard
 +bsd/dev/raphael_touch.c	standard
++bsd/dev/polaris_touch.c	standard
 +bsd/dev/hakios.buttons.c	standard
 +bsd/dev/hakios.battery.c	standard
 +bsd/dev/hakios.ufs.c	standard
