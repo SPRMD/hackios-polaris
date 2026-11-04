@@ -32,6 +32,10 @@
  * a write of the pointer with STOP_STRETCH (the bus is held for a repeated START) followed by
  * a plain read. The function descriptions are read from the part itself rather than assumed,
  * because the offsets of the 2-D touch function's report registers depend on them.
+ *
+ * The display is 1080x2160 -- not the 2340 of the taller 2018 phones. This tree's panel nodes
+ * are dsi_jdi_fhd_nt35596s_video and dsi_ebbg_fhd_ft8716_video (polaris-p0.dtsi), and the
+ * first one's timing@0 gives qcom,mdss-dsi-panel-width 1080 and -height 2160.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -113,7 +117,7 @@ extern kern_return_t thread_terminate(thread_t);
 #define RMI_F01_NOSLEEP     (1u << 2)
 
 #define POLARIS_WIDTH       1080u
-#define POLARIS_HEIGHT      2340u
+#define POLARIS_HEIGHT      2160u
 #define TOUCH_MAX           10u
 
 static struct {
