@@ -269,6 +269,24 @@ def main():
         findings.append('bootarg() reads key=value arguments, which is what platform= and the '
                         'rest are')
 
+    # persist_logs is derived from the platform, so a platform without log_other_cpu never
+    # writes its log to storage: on a phone the console is a photograph, and every polaris
+    # crash so far left nothing else. The phone said "platform polaris (log console only)"
+    # even after the platform itself was recognised, which is what made this visible.
+    plat_start = src.find('static const struct platform platform_polaris')
+    if plat_start < 0:
+        problems.append('there is no platform_polaris table')
+    else:
+        plat_end = src.find('};', plat_start)
+        block = strip_comments(src[plat_start:plat_end], keep_strings=False)
+        if 'log_other_cpu' not in block:
+            problems.append(
+                'platform_polaris does not set log_other_cpu, so persist_logs is 0 for it and '
+                'flush_log() writes nothing: a crash on the phone leaves no log, only a '
+                'photograph (the screen said "platform polaris (log console only)")')
+        else:
+            findings.append('polaris keeps its log on the phone, not only on the console')
+
     print('QEMU-only surface:')
     for f in findings:
         print('  ' + f)

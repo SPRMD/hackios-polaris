@@ -594,6 +594,15 @@ static const struct platform platform_polaris = {
 	.name = "polaris", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000,
 	.cores = 4, .core_shift = 8, .small_cores = 0x0f,
+	/*
+	 * log_other_cpu is what persist_logs is derived from (see efi_main), and persist_logs is
+	 * what flush_log() checks: without it the log only ever reaches the console. On a phone
+	 * the console is a photograph, so every polaris crash so far left no readable record --
+	 * the logdump partition was never written, which read as "the log is empty" rather than
+	 * "the log was never stored". polaris has the same 64 MB logdump at LBA 49152 that
+	 * raphael has, so it asks for persistence by the same rule.
+	 */
+	.log_other_cpu = 1,
 };
 
 /* ------------------------------------------------------------------------ */
