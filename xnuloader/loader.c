@@ -2629,12 +2629,28 @@ bootarg(const char *prefix)
 				if (c != text && c[-1] != ' ') {
 					continue;
 				}
-				/* prefix, then a space or the end: "platform=polarisx" is not a match */
+				/*
+				 * A prefix ending in '=' is a whole "key=" and what follows it is the
+				 * value, so there is nothing more to check: bootarg("platform=") must
+				 * return "polaris". Requiring a space or the end here (which this did)
+				 * made every key=value argument unreadable -- platform=, ufs=,
+				 * loader_return_after= -- so PLAT stayed at its qemu default, the log
+				 * was written to the console and never to storage, and a crash left
+				 * only a photograph behind. A prefix that does not end in '=' is a
+				 * word, and that one does have to end at a space or the line's end:
+				 * "platform" alone must not match "platform=polaris".
+				 */
 				size_t i = 0;
 				while (i < want && c[i] == prefix[i]) {
 					i++;
 				}
-				if (i == want && (c[i] == 0 || c[i] == ' ')) {
+				if (i != want) {
+					continue;
+				}
+				if (prefix[want - 1] == '=') {
+					return c + want;
+				}
+				if (c[i] == 0 || c[i] == ' ' || c[i] == '=') {
 					return c + want;
 				}
 			}

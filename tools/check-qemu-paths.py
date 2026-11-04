@@ -242,6 +242,33 @@ def main():
     else:
         findings.append('the platform is named by payload.cmdline platform=polaris')
 
+    # ... but asking for platform= is not enough: bootarg() itself has to be able to answer.
+    # It used to require a space or the end of the line after the prefix, so every key=value
+    # argument -- platform=, ufs=, loader_return_after= -- came back NULL. The loader then
+    # stayed on the QEMU platform, printed "platform qemu-virt (log console only)", kept its
+    # log on the console instead of the logdump partition, and a phone that crashed there left
+    # nothing but a photograph. Seen on the phone, not deduced: the screen said qemu-virt while
+    # the payload said platform=polaris. This checks the matcher's actual behaviour.
+    unexpected = []
+    body = src[src.find('bootarg(const char *prefix)'):]
+    body = strip_comments(body, keep_strings=True)
+    if "prefix[want - 1] == '='" not in body:
+        unexpected.append(
+            'bootarg() does not treat a prefix ending in "=" as a whole key, so '
+            'bootarg("platform=") cannot return the value -- this is the bug that made the '
+            'phone report "platform qemu-virt (log console only)"')
+    elif "c[i] == '='" not in body:
+        unexpected.append('bootarg() no longer matches a bare word prefix before "="')
+    # Only the arguments this file itself asks for. touchscreen= is not among them: the loader
+    # passes it through to the kernel, which is what reads it.
+    if unseen := [p for p in ('platform=', 'ufs=') if p not in src]:
+        unexpected.append('the loader stopped asking for %s' % unseen[0])
+    if unexpected:
+        problems.extend(unexpected)
+    else:
+        findings.append('bootarg() reads key=value arguments, which is what platform= and the '
+                        'rest are')
+
     print('QEMU-only surface:')
     for f in findings:
         print('  ' + f)
