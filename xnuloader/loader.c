@@ -4034,14 +4034,37 @@ usb_poll_command(void)
 static void
 usb_command_loop(void)
 {
-	screen_quiet = 1;
+	/*
+	 * The screen used to go quiet on the first line of this loop, so from that moment on
+	 * nothing the loader did could be seen on the phone: a board where the host never
+	 * enumerated the device looked exactly like a board that was working. That is what made
+	 * this port's USB failures unreadable for a whole evening -- the screen showed "usb:
+	 * started" and then froze, and the only way to tell "waiting for a host" from "the host
+	 * is asking and we are not answering" was to guess.
+	 *
+	 * It now says what it is doing: one line when the device state changes, and one per
+	 * command received. The commands come with their argument, because the difference
+	 * between GETVAR and DOWNLOAD is the whole difference between a working session and one
+	 * that hangs.
+	 */
+	uint32_t reported_state = 0xffffffffu;
+
+	print("usb: command loop; waiting for the host\n");
 	for (;;) {
 		char cmd[128];
 		int64_t n;
 
 		if (!usb_connected) {
+			if (reported_state != 0) {
+				print("usb: not connected (waiting for the cable or the host)\n");
+				reported_state = 0;
+			}
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
+		}
+		if (reported_state != 1) {
+			print("usb: connected\n");
+			reported_state = 1;
 		}
 		n = usb_rx(usb_rx_buf, 511);
 		if (n <= 0) {
@@ -4052,6 +4075,7 @@ usb_command_loop(void)
 		}
 		memcpy(cmd, usb_rx_buf, (size_t)n);
 		cmd[n] = 0;
+		print("usb: <- '%s'\n", cmd);
 		fb_command(cmd);
 	}
 }
