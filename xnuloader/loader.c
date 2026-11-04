@@ -3649,6 +3649,19 @@ usb_start(void)
 		print("usb: no transfer buffers\n");
 		return 0;
 	}
+	/*
+	 * The device is up: start_ex() has configured it and the controller is attached. The
+	 * connection state, though, is only ever learned from a UsbDeviceEventDeviceStateChange
+	 * event, and the protocol has no way to ask for it. On this board that event is raised
+	 * while start_ex() is still running and is gone by the time anyone reads the queue, so
+	 * usb_connected stayed 0 and usb_command_loop() sat in "not connected (waiting for the
+	 * cable or the host)" for ever -- on the phone, with the cable in and the host asking.
+	 *
+	 * So: treat a successful start_ex() as connected, and let the loop's own event handling
+	 * correct it if the host really is absent. A device that is not attached simply never
+	 * sends a transfer notification, and the state change still arrives when the cable goes.
+	 */
+	usb_connected = 1;
 	print("usb: started\n");
 	return 1;
 }
@@ -4058,6 +4071,17 @@ usb_command_loop(void)
 			if (reported_state != 0) {
 				print("usb: not connected (waiting for the cable or the host)\n");
 				reported_state = 0;
+			}
+			/*
+			 * usb_wait(0xff) returns on the next device state change -- but a state change
+			 * that is raised and dropped between polls is never seen, and then this waits
+			 * for ever with the cable in. The endpoint request below is what makes the host
+			 * talk to us at all, so it is posted from here too: if the device is attached,
+			 * the request goes out and the connection is learned from what comes back.
+			 */
+			if (!EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
+				usb_connected = 1;
+				continue;
 			}
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
